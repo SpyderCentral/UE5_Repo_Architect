@@ -1,0 +1,2554 @@
+import * as THREE from 'three';
+import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js';
+import { OBJExporter } from 'three/examples/jsm/exporters/OBJExporter.js';
+import { LevelLayout, PointOfInterest, Model3DSpec, Model3DPartSpec, Asset3DCategory } from '../types';
+import { applyPBRMaterialToMesh, PBRTextureStyle } from './pbrTextureGenerator';
+import { Mesh2MotionEngine, RigType, Mesh2MotionClip } from './mesh2motion';
+
+export type { Asset3DCategory, RigType, Mesh2MotionClip, PBRTextureStyle };
+
+export interface Generated3DAsset {
+  id: string;
+  name: string;
+  category: Asset3DCategory;
+  prompt: string;
+  archetype?: string;
+  scene: THREE.Group;
+  createdAt: number;
+  source2DImage?: string;
+  rigType?: RigType;
+  animations?: Mesh2MotionClip[];
+  isRigged?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Download and Exporter Utilities
+// ---------------------------------------------------------------------------
+
+/**
+ * Downloads a Blob or Uint8Array as a file in the browser
+ */
+export function downloadFile(content: Blob | string | Uint8Array, filename: string, mimeType = 'application/octet-stream') {
+  let blob: Blob;
+  if (content instanceof Blob) {
+    blob = content;
+  } else if (typeof content === 'string') {
+    blob = new Blob([content], { type: mimeType });
+  } else {
+    blob = new Blob([content], { type: mimeType });
+  }
+
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
+export const downloadBlob = downloadFile;
+export const generateGodot4Scene = generateGodotScene;
+export const generateGodot4Controller = generateGodotScript;
+export const generateUnityManifest = generateUnityPrefabManifest;
+export const generateUnityController = generateUnityCSharpScript;
+
+export interface Generate3DAssetOptions {
+  name?: string;
+  aiSpec?: Model3DSpec;
+  forceRig?: boolean;
+  sourceImage?: string;
+  seed?: string | number;
+}
+
+export async function generate3DAssetFromPrompt(
+  prompt: string,
+  category: Asset3DCategory = 'Character',
+  options?: Generate3DAssetOptions
+): Promise<Generated3DAsset> {
+  const name = options?.name || prompt.slice(0, 24).trim() || `${category}_Asset`;
+  const seed = options?.seed || `${name}_${prompt}_${Date.now()}`;
+  
+  let scene: THREE.Group;
+  let clips: Mesh2MotionClip[] = [];
+  let isRigged = false;
+  let rigType: RigType = 'humanoid';
+
+  if (options?.aiSpec) {
+    scene = buildMeshFrom3DSpec(options.aiSpec);
+    if (options.aiSpec.rigType) rigType = options.aiSpec.rigType;
+  } else {
+    scene = generate3DAsset(category, prompt, undefined, seed);
+  }
+
+  if (options?.forceRig || category === 'Character') {
+    try {
+      const rigged = Mesh2MotionEngine.rigAndAnimate(scene, rigType);
+      scene = rigged.riggedGroup;
+      clips = rigged.clips;
+      isRigged = true;
+      (scene as any).animations = clips.map(c => c.clip);
+      (scene as any).__mesh2motion = rigged;
+    } catch (e) {
+      console.warn('Auto-rigging fallback:', e);
+    }
+  }
+
+  return {
+    id: `asset_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+    name,
+    category,
+    prompt,
+    scene,
+    createdAt: Date.now(),
+    source2DImage: options?.sourceImage,
+    rigType,
+    animations: clips,
+    isRigged
+  };
+}
+
+/**
+ * Exports a Three.js scene/group to binary .GLB format (glTF 2.0).
+ * Compatible with Unreal Engine 5, Godot 4, Unity, and Blender.
+ * Embeds Mesh2Motion animations if present.
+ */
+export async function exportToGLB(object: THREE.Object3D, animations?: THREE.AnimationClip[]): Promise<Uint8Array> {
+  return new Promise((resolve, reject) => {
+    const exporter = new GLTFExporter();
+    const anims = animations || (object as any).animations || (object as any).__mesh2motion?.clips || [];
+    exporter.parse(
+      object,
+      (result) => {
+        if (result instanceof ArrayBuffer) {
+          resolve(new Uint8Array(result));
+        } else {
+          const jsonStr = JSON.stringify(result);
+          const encoder = new TextEncoder();
+          resolve(encoder.encode(jsonStr));
+        }
+      },
+      (error) => reject(error),
+      { 
+        binary: true,
+        animations: anims
+      }
+    );
+  });
+}
+
+/**
+ * Exports a Three.js scene/group to Wavefront .OBJ format.
+ */
+export function exportToOBJ(object: THREE.Object3D): string {
+  const exporter = new OBJExporter();
+  return exporter.parse(object);
+}
+
+/**
+ * Generates an accompanying Wavefront .MTL material definitions file.
+ */
+export function generateOBJMaterialFile(assetName: string): string {
+  const safeName = assetName.replace(/[^a-zA-Z0-9_]/g, '_');
+  return `# Wavefront MTL generated by Unreal Engine 5 AI Architect
+newmtl Mat_Base_${safeName}
+Ka 0.2000 0.2000 0.2000
+Kd 0.7500 0.7500 0.7500
+Ks 0.5000 0.5000 0.5000
+Ns 64.0000
+d 1.0000
+illum 2
+
+newmtl Mat_Accent_${safeName}
+Ka 0.1000 0.4000 0.6000
+Kd 0.2000 0.7000 0.9000
+Ks 0.9000 0.9000 0.9000
+Ns 128.0000
+d 1.0000
+illum 2
+`;
+}
+
+/**
+ * Exports Three.js object to native Three.js JSON Object scene format.
+ */
+export function exportToThreeJSON(object: THREE.Object3D): string {
+  return JSON.stringify(object.toJSON(), null, 2);
+}
+
+/**
+ * Generates an Unreal Engine 5 .t3d Actor / Level script.
+ * Can be directly pasted or imported into Unreal Engine 5 viewport.
+ */
+export function generateUE5T3DScript(assetName: string, category: Asset3DCategory, layout?: LevelLayout): string {
+  const safeName = assetName.replace(/[^a-zA-Z0-9_]/g, '_');
+  
+  if (category === 'Level' && layout) {
+    let actorsText = '';
+    layout.pointsOfInterest.forEach((poi, idx) => {
+      const posX = (poi.x - 50) * 100;
+      const posY = (poi.y - 50) * 100;
+      actorsText += `
+   Begin Actor Class=/Script/Engine.TargetPoint Name=POI_${idx}_${safeName} Archetype=/Script/Engine.TargetPoint'/Script/Engine.Default__TargetPoint'
+      Begin Object Class=/Script/Engine.SceneComponent Name="SceneComp"
+         RelativeLocation=(X=${posX.toFixed(1)},Y=${posY.toFixed(1)},Z=50.000000)
+      End Object
+      RootComponent=SceneComp
+      ActorLabel="${poi.name} (${poi.type})"
+   End Actor`;
+    });
+
+    return `Begin Map
+   Begin Level
+   Begin Actor Class=/Script/Engine.StaticMeshActor Name=Floor_${safeName} Archetype=/Script/Engine.StaticMeshActor'/Script/Engine.Default__StaticMeshActor'
+      Begin Object Class=/Script/Engine.StaticMeshComponent Name="StaticMeshComponent0"
+         StaticMesh=StaticMesh'/Engine/BasicShapes/Cube.Cube'
+         RelativeScale3D=(X=50.000000,Y=50.000000,Z=0.500000)
+         RelativeLocation=(X=0.000000,Y=0.000000,Z=0.000000)
+      End Object
+      StaticMeshComponent=StaticMeshComponent0
+      RootComponent=StaticMeshComponent0
+      ActorLabel="Level_Floor_${safeName}"
+   End Actor${actorsText}
+   End Level
+End Map`;
+  }
+
+  return `Begin Map
+   Begin Level
+   Begin Actor Class=/Script/Engine.StaticMeshActor Name=SMA_${safeName} Archetype=/Script/Engine.StaticMeshActor'/Script/Engine.Default__StaticMeshActor'
+      Begin Object Class=/Script/Engine.StaticMeshComponent Name="StaticMeshComponent0"
+         StaticMesh=StaticMesh'/Engine/BasicShapes/Cube.Cube'
+         RelativeLocation=(X=0.000000,Y=0.000000,Z=100.000000)
+      End Object
+      StaticMeshComponent=StaticMeshComponent0
+      RootComponent=StaticMeshComponent0
+      ActorLabel="${safeName}_Asset"
+   End Actor
+   End Level
+End Map`;
+}
+
+/**
+ * Generates an automated Unreal Engine 5 Python Asset Import Script (.py).
+ */
+export function generateUE5PythonImporter(assetName: string, glbFilename: string, category: Asset3DCategory = 'Prop'): string {
+  const safeName = assetName.replace(/[^a-zA-Z0-9_]/g, '_');
+  return `# Unreal Engine 5 Automated Asset Importer
+# Place this script in your UE5 Content folder or run via Tools -> Execute Python Script
+
+import unreal
+import os
+
+asset_name = "${safeName}"
+glb_file = "${glbFilename}"
+destination_path = "/Game/Assets/${category}/${safeName}"
+
+def import_asset():
+    current_dir = os.path.dirname(os.path.abspath(__file__)) if '__file__' in locals() else unreal.Paths.project_content_dir()
+    source_file = os.path.join(current_dir, glb_file)
+
+    task = unreal.AssetImportTask()
+    task.filename = source_file
+    task.destination_path = destination_path
+    task.destination_name = asset_name
+    task.replace_existing = True
+    task.automated = True
+    task.save = True
+
+    # Configure glTF / Interchange options
+    options = unreal.FbxImportUI() if hasattr(unreal, 'FbxImportUI') else None
+    task.options = options
+
+    unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([task])
+    unreal.log(f"Successfully imported {asset_name} to {destination_path}")
+
+if __name__ == '__main__':
+    import_asset()
+`;
+}
+
+/**
+ * Generates a Godot 4 .tscn scene file referencing the asset.
+ */
+export function generateGodotScene(assetName: string, glbFilenameOrCategory: string = `${assetName}.glb`, category: Asset3DCategory = 'Character'): string {
+  const safeName = assetName.replace(/[^a-zA-Z0-9_]/g, '_');
+  let glbFilename = glbFilenameOrCategory;
+  let resolvedCategory = category;
+  if (['Character', 'Environment', 'Prop', 'UI', 'Level'].includes(glbFilenameOrCategory)) {
+    resolvedCategory = glbFilenameOrCategory as Asset3DCategory;
+    glbFilename = `${safeName.toLowerCase()}.glb`;
+  }
+  const isCharacter = resolvedCategory === 'Character';
+  const bodyType = isCharacter ? 'CharacterBody3D' : 'StaticBody3D';
+
+  return `[gd_scene load_steps=3 format=3 uid="uid://${Math.random().toString(36).substring(2, 12)}"]
+
+[ext_resource type="PackedScene" path="res://${glbFilename}" id="1_mesh"]
+
+[sub_resource type="BoxShape3D" id="BoxShape3D_coll"]
+size = Vector3(1.8, ${isCharacter ? '2.2' : '1.8'}, 1.8)
+
+[node name="${safeName}" type="Node3D"]
+
+[node name="ModelInstance" parent="." instance=ExtResource("1_mesh")]
+
+[node name="${bodyType}" type="${bodyType}" parent="."]
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="${bodyType}"]
+shape = SubResource("BoxShape3D_coll")
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, ${isCharacter ? '1.1' : '0.9'}, 0)
+`;
+}
+
+/**
+ * Generates Godot 4 GDScript controller (.gd).
+ */
+export function generateGodotScript(assetName: string, category: Asset3DCategory = 'Character'): string {
+  const safeName = assetName.replace(/[^a-zA-Z0-9_]/g, '_');
+  return `# Godot 4 Asset Script for ${safeName} (${category})
+extends Node3D
+
+@export var interactable: bool = true
+@export var highlight_color: Color = Color(0.2, 0.8, 1.0, 1.0)
+
+func _ready() -> void:
+    print("${safeName} initialized in scene tree.")
+
+func on_interact() -> void:
+    if not interactable:
+        return
+    print("Player interacted with ${safeName}")
+`;
+}
+
+/**
+ * Generates a Unity Prefab / Asset manifest descriptor JSON.
+ */
+export function generateUnityPrefabManifest(assetName: string, glbFilenameOrCategory: string = `${assetName}.glb`, category: Asset3DCategory = 'Character'): string {
+  const safeName = assetName.replace(/[^a-zA-Z0-9_]/g, '');
+  let glbFilename = glbFilenameOrCategory;
+  let resolvedCategory = category;
+  if (['Character', 'Environment', 'Prop', 'UI', 'Level'].includes(glbFilenameOrCategory)) {
+    resolvedCategory = glbFilenameOrCategory as Asset3DCategory;
+    glbFilename = `${safeName.toLowerCase()}.glb`;
+  }
+  return JSON.stringify(
+    {
+      unityVersion: "2022.3.x / 6.0+",
+      assetType: "Prefab",
+      name: assetName,
+      sourceModel: glbFilename,
+      category: resolvedCategory,
+      components: [
+        { type: "Transform", position: [0, 0, 0], rotation: [0, 0, 0, 1], scale: [1, 1, 1] },
+        { type: "MeshFilter", sharedMesh: `${assetName}_Mesh` },
+        { type: "MeshRenderer", materials: ["Default-PBR-Material"] },
+        { type: resolvedCategory === 'Character' ? "CapsuleCollider" : "BoxCollider", center: [0, 1, 0], size: [1.8, 2.0, 1.8] }
+      ],
+      instructions: "Drag the accompanying .glb file into your Unity Assets folder, then place this prefab into your Hierarchy."
+    },
+    null,
+    2
+  );
+}
+
+/**
+ * Generates a companion Unity C# script (.cs).
+ */
+export function generateUnityCSharpScript(assetName: string, category: Asset3DCategory = 'Character'): string {
+  const safeName = assetName.replace(/[^a-zA-Z0-9_]/g, '');
+  return `// Unity C# Asset Controller for ${safeName} (${category})
+using UnityEngine;
+
+[DisallowMultipleComponent]
+public class ${safeName}Controller : MonoBehaviour
+{
+    [Header("Asset Properties")]
+    public string category = "${category}";
+    public bool isInteractable = true;
+
+    [Header("Visual Effects")]
+    public Material highlightMaterial;
+    private Renderer[] renderers;
+
+    private void Awake()
+    {
+        renderers = GetComponentsInChildren<Renderer>();
+    }
+
+    public void OnInteract()
+    {
+        if (!isInteractable) return;
+        Debug.Log("Interacted with " + gameObject.name);
+    }
+}
+`;
+}
+
+/**
+ * Generates an automated Unreal Engine 5 Mesh2Motion Skeletal IK Retargeter script (.py)
+ * Configures Control Rig, IK Rig, and animation retargeting to Manny / Quinn.
+ */
+export function generateMesh2MotionUE5Script(assetName: string, rigType: string = 'humanoid'): string {
+  return Mesh2MotionEngine.generateUE5RetargeterScript(assetName, rigType as any);
+}
+
+// ---------------------------------------------------------------------------
+// AI Specification 3D Mesh Builder
+// ---------------------------------------------------------------------------
+
+/**
+ * Creates Three.js geometry from an AI-generated Model3DPartSpec
+ */
+function createGeometryFromSpec(shape: string, scale: [number, number, number]): THREE.BufferGeometry {
+  const [sx, sy, sz] = scale;
+  switch (shape) {
+    case 'sphere':
+      return new THREE.SphereGeometry(Math.max(sx, sy, sz) / 2, 24, 24);
+    case 'cylinder':
+      return new THREE.CylinderGeometry(sx / 2, sx / 2, sy, 20);
+    case 'cone':
+      return new THREE.ConeGeometry(sx / 2, sy, 20);
+    case 'torus':
+      return new THREE.TorusGeometry(Math.max(sx, sz) / 2, Math.max(sy, 0.05) / 2, 16, 32);
+    case 'capsule':
+      return new THREE.CapsuleGeometry(Math.max(sx, sz) / 2, Math.max(sy - sx, 0.1), 12, 16);
+    case 'ring':
+      return new THREE.RingGeometry(sx * 0.3, sx * 0.5, 24);
+    case 'pyramid':
+      return new THREE.ConeGeometry(sx / 2, sy, 4);
+    case 'wedge': {
+      const geo = new THREE.CylinderGeometry(0, sx / 2, sy, 3);
+      return geo;
+    }
+    case 'box':
+    default:
+      return new THREE.BoxGeometry(sx, sy, sz);
+  }
+}
+
+function determinePBRStyle(partName: string, color: string, category: string): PBRTextureStyle {
+  const name = partName.toLowerCase();
+  if (name.includes('armor') || name.includes('plate') || name.includes('chassis') || name.includes('helm') || name.includes('pauldron') || name.includes('shield')) {
+    return 'cyber_armor';
+  }
+  if (name.includes('steel') || name.includes('metal') || name.includes('blade') || name.includes('barrel') || name.includes('hilt') || name.includes('sword') || name.includes('gun') || name.includes('rifle')) {
+    return 'brushed_steel';
+  }
+  if (name.includes('leather') || name.includes('boot') || name.includes('belt') || name.includes('strap') || name.includes('grip') || name.includes('holster')) {
+    return 'worn_leather';
+  }
+  if (name.includes('gold') || name.includes('crown') || name.includes('trim') || name.includes('inlay') || name.includes('filigree') || name.includes('ornament')) {
+    return 'gold_inlay';
+  }
+  if (name.includes('carbon') || name.includes('fiber') || name.includes('speeder') || name.includes('fin') || name.includes('turbine')) {
+    return 'carbon_fiber';
+  }
+  if (name.includes('glow') || name.includes('circuit') || name.includes('rune') || name.includes('energy') || name.includes('core') || name.includes('vent') || name.includes('visor')) {
+    return 'glowing_circuit';
+  }
+  if (name.includes('stone') || name.includes('rock') || name.includes('wall') || name.includes('pillar') || name.includes('cliff') || name.includes('crag') || name.includes('ruin') || category === 'Environment' || category === 'Level') {
+    return 'weathered_stone';
+  }
+  if (name.includes('scale') || name.includes('claw') || name.includes('chitin') || name.includes('horn') || name.includes('tail') || name.includes('beast') || name.includes('dragon')) {
+    return 'alien_chitin';
+  }
+  if (name.includes('robe') || name.includes('cape') || name.includes('tunic') || name.includes('cloth') || name.includes('fabric') || name.includes('hood')) {
+    return 'cloth_weave';
+  }
+  if (name.includes('glass') || name.includes('crystal') || name.includes('flask') || name.includes('potion') || name.includes('gem') || name.includes('orb')) {
+    return 'crystal_glass';
+  }
+  return category === 'Character' ? 'cyber_armor' : 'brushed_steel';
+}
+
+/**
+ * Builds a full Three.js Group from an AI Model3DSpec with Unreal Engine 5 PBR fidelity
+ * and optional Mesh2Motion auto-rigging.
+ */
+export function buildMeshFrom3DSpec(spec: Model3DSpec): THREE.Group {
+  const group = new THREE.Group();
+  group.name = spec.name || 'AI_Generated_Model';
+
+  const isCharacter = spec.category === 'Character' || 
+    (spec.name && (
+      spec.name.toLowerCase().includes('character') || 
+      spec.name.toLowerCase().includes('zombie') || 
+      spec.name.toLowerCase().includes('mutant') || 
+      spec.name.toLowerCase().includes('creature') || 
+      spec.name.toLowerCase().includes('monster') || 
+      spec.name.toLowerCase().includes('knight') || 
+      spec.name.toLowerCase().includes('warrior') ||
+      spec.name.toLowerCase().includes('undead')
+    ));
+
+  // Extract primary palette colors from spec parts
+  const primaryColors = spec.parts.map(p => p.color).filter(Boolean);
+  const fleshColor = primaryColors[0] || (isCharacter ? '#881337' : '#334155');
+  const boneColor = primaryColors.find(c => c.toLowerCase().includes('fff') || c.toLowerCase().includes('d4d4') || c.toLowerCase().includes('e2e8')) || '#d4d4d8';
+  const glowColor = primaryColors.find(c => c.toLowerCase().includes('f59e') || c.toLowerCase().includes('ea58') || c.toLowerCase().includes('00f') || c.toLowerCase().includes('06b')) || '#f59e0b';
+
+  spec.parts.forEach(part => {
+    try {
+      const geo = createGeometryFromSpec(part.shape, part.scale);
+      geo.computeVertexNormals();
+
+      const mesh = new THREE.Mesh(geo);
+      mesh.name = part.name;
+      mesh.position.set(part.position[0] || 0, part.position[1] || 0, part.position[2] || 0);
+
+      if (part.rotation) {
+        mesh.rotation.set(part.rotation[0] || 0, part.rotation[1] || 0, part.rotation[2] || 0);
+      }
+
+      // High-Fidelity Unreal Engine 5 PBR Shading
+      applyPBRMaterialToMesh(mesh, {
+        style: part.textureStyle || determinePBRStyle(part.name, part.color, spec.category),
+        baseColor: part.color,
+        metalness: part.metalness ?? (spec.category === 'Character' ? 0.35 : 0.6),
+        roughness: part.roughness ?? 0.45,
+        emissive: part.emissive,
+        emissiveIntensity: part.emissiveIntensity,
+        clearcoat: part.clearcoat ?? (part.metalness && part.metalness > 0.5 ? 0.3 : 0.0),
+        clearcoatRoughness: part.clearcoatRoughness ?? 0.1,
+        opacity: part.opacity,
+        wireframe: part.wireframe
+      });
+
+      group.add(mesh);
+    } catch (e) {
+      console.warn('Failed to construct part', part.name, e);
+    }
+  });
+
+  // If character has fewer than 15 parts or very small bounding volume, augment with anatomical fidelity
+  if (isCharacter && (spec.parts.length < 15 || group.children.length < 15)) {
+    // If the model was only a sparse few blocks, enrich with complete anatomical structures
+    const isNecrotic = (spec.name + ' ' + (spec.description || '')).toLowerCase().includes('zombie') ||
+      (spec.name + ' ' + (spec.description || '')).toLowerCase().includes('mutant') ||
+      (spec.name + ' ' + (spec.description || '')).toLowerCase().includes('creature') ||
+      (spec.name + ' ' + (spec.description || '')).toLowerCase().includes('terrifying') ||
+      (spec.name + ' ' + (spec.description || '')).toLowerCase().includes('undead');
+
+    if (isNecrotic) {
+      const prng = createPRNG(spec.name || 'creature_enrich');
+      buildNecroticMutantZombie(group, prng);
+    } else {
+      const prng = createPRNG(spec.name || 'char_enrich');
+      buildKnightPaladin(group, prng);
+    }
+  }
+
+  // Measure and normalize character bounds
+  const rawBbox = new THREE.Box3().setFromObject(group);
+  const rawSize = rawBbox.getSize(new THREE.Vector3());
+  if (isCharacter && rawSize.y > 0 && (rawSize.y < 1.4 || rawSize.y > 3.0)) {
+    const targetHeight = 1.95;
+    const factor = targetHeight / rawSize.y;
+    group.scale.set(factor, factor, factor);
+    
+    // Re-align to ground
+    const updatedBbox = new THREE.Box3().setFromObject(group);
+    group.position.y = -updatedBbox.min.y;
+  }
+
+  // Base platform
+  const baseGeo = new THREE.CylinderGeometry(1.6, 1.7, 0.08, 32);
+  const baseMesh = new THREE.Mesh(baseGeo);
+  baseMesh.name = 'Ground_Pedestal';
+  applyPBRMaterialToMesh(baseMesh, {
+    style: 'cyber_armor',
+    baseColor: '#0f172a',
+    metalness: 0.2,
+    roughness: 0.8
+  });
+  baseMesh.position.y = -0.04;
+  group.add(baseMesh);
+
+  // Mesh2Motion Auto-Rigging for Characters or rigged specifications
+  if (isCharacter || spec.rigType) {
+    try {
+      const preferredRig: RigType = spec.rigType || (
+        (spec.name && (spec.name.toLowerCase().includes('creature') || spec.name.toLowerCase().includes('mutant') || spec.name.toLowerCase().includes('zombie')))
+          ? 'creature'
+          : 'humanoid'
+      );
+      const rigged = Mesh2MotionEngine.rigAndAnimate(group, preferredRig);
+      (rigged.riggedGroup as any).animations = rigged.clips.map(c => c.clip);
+      (rigged.riggedGroup as any).__mesh2motion = rigged;
+      return rigged.riggedGroup;
+    } catch (rigErr) {
+      console.warn('Mesh2Motion auto-rigging fell back to static group:', rigErr);
+    }
+  }
+
+  return group;
+}
+
+// ---------------------------------------------------------------------------
+// Seeded PRNG and Variation Engine (Ensures Every Request Is Unique)
+// ---------------------------------------------------------------------------
+
+function hashString(str: string): number {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) - hash) + str.charCodeAt(i);
+    hash |= 0;
+  }
+  return hash;
+}
+
+export function createPRNG(seed?: string | number) {
+  let s = seed !== undefined 
+    ? (typeof seed === 'number' ? Math.floor(Math.abs(seed)) : Math.abs(hashString(seed))) 
+    : Math.floor(Math.random() * 2147483647);
+  if (s === 0) s = 123456789;
+
+  const next = (): number => {
+    s = (s * 16807) % 2147483647;
+    return (s - 1) / 2147483646;
+  };
+
+  return {
+    next,
+    range: (min: number, max: number): number => min + next() * (max - min),
+    int: (min: number, max: number): number => Math.floor(min + next() * (max - min + 1)),
+    choice: <T>(arr: T[]): T => arr[Math.floor(next() * arr.length) % arr.length],
+    color: (palette: number[]): number => palette[Math.floor(next() * palette.length) % palette.length],
+    bool: (chance = 0.5): boolean => next() < chance,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic Procedural Character Generators
+// ---------------------------------------------------------------------------
+
+/**
+ * Procedural Tactical Pointman / Spec-Ops Soldier / Sci-Fi Marine
+ */
+function buildTacticalPointman(group: THREE.Group, prng: ReturnType<typeof createPRNG>) {
+  const camoColors = [0x374151, 0x1f2937, 0x475569, 0x27272a, 0x3f3f46, 0x2e382e];
+  const armorColors = [0x111827, 0x0f172a, 0x18181b, 0x1e293b, 0x262626];
+  const visorColors = [0x00f0ff, 0x06b6d4, 0x10b981, 0xf59e0b, 0xef4444, 0x8b5cf6];
+
+  const camoColor = prng.color(camoColors);
+  const armorColor = prng.color(armorColors);
+  const visorColor = prng.color(visorColors);
+
+  const camoMat = new THREE.MeshStandardMaterial({ color: camoColor, roughness: 0.85 });
+  const armorMat = new THREE.MeshStandardMaterial({ color: armorColor, metalness: prng.range(0.6, 0.9), roughness: 0.3 });
+  const glowVisor = new THREE.MeshStandardMaterial({ color: visorColor, emissive: visorColor, emissiveIntensity: 1.4 });
+
+  const heightMod = prng.range(0.9, 1.15);
+  const widthMod = prng.range(0.9, 1.18);
+
+  // Torso / Plate Carrier
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.75 * widthMod, 0.9 * heightMod, 0.42), armorMat);
+  torso.name = 'Chest Rig Plate Carrier';
+  torso.position.y = 1.35 * heightMod;
+  group.add(torso);
+
+  // Ballistic Ceramic Chest Plate
+  const plate = new THREE.Mesh(new THREE.BoxGeometry(0.62 * widthMod, 0.65 * heightMod, 0.12), armorMat);
+  plate.name = 'Ceramic Armor Plate';
+  plate.position.set(0, 1.35 * heightMod, 0.23);
+  group.add(plate);
+
+  // Tactical pouches (2 to 4)
+  const pouchCount = prng.int(2, 4);
+  const pouchSpacing = 0.38 / Math.max(1, pouchCount - 1);
+  for (let i = 0; i < pouchCount; i++) {
+    const x = -0.19 + i * pouchSpacing;
+    const pouch = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.26, 0.11), camoMat);
+    pouch.name = `Tactical Ammo Pouch ${i + 1}`;
+    pouch.position.set(x, 1.15 * heightMod, 0.27);
+    group.add(pouch);
+  }
+
+  // Head
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.24 * widthMod, 16, 16), camoMat);
+  head.name = 'Head';
+  head.position.y = 2.0 * heightMod;
+  group.add(head);
+
+  // Helmet style
+  const helmetStyle = prng.choice(['high-cut', 'full-mask', 'tactical-cap']);
+  if (helmetStyle === 'high-cut') {
+    const helmet = new THREE.Mesh(new THREE.CylinderGeometry(0.27 * widthMod, 0.29 * widthMod, 0.22, 18), armorMat);
+    helmet.name = 'High-Cut Ballistic Helmet';
+    helmet.position.y = 2.08 * heightMod;
+    group.add(helmet);
+
+    // NVG
+    const nvgTubes = prng.choice([1, 2, 4]);
+    if (nvgTubes === 4) {
+      [-0.15, -0.05, 0.05, 0.15].forEach((x, idx) => {
+        const tubeGeo = new THREE.CylinderGeometry(0.04, 0.04, 0.16, 10);
+        tubeGeo.rotateX(Math.PI / 3);
+        const tube = new THREE.Mesh(tubeGeo, armorMat);
+        tube.name = `Panoramic NVG Tube ${idx + 1}`;
+        tube.position.set(x, 2.22 * heightMod, 0.28);
+        group.add(tube);
+      });
+    } else {
+      const visorGeo = new THREE.BoxGeometry(0.32, 0.08, 0.12);
+      const visor = new THREE.Mesh(visorGeo, glowVisor);
+      visor.name = 'Tactical HUD Visor';
+      visor.position.set(0, 2.02 * heightMod, 0.22);
+      group.add(visor);
+    }
+  } else {
+    // Full face visor
+    const visorGeo = new THREE.BoxGeometry(0.34, 0.14, 0.14);
+    const visor = new THREE.Mesh(visorGeo, glowVisor);
+    visor.name = 'Recon Optical Visor';
+    visor.position.set(0, 2.02 * heightMod, 0.2);
+    group.add(visor);
+  }
+
+  // Arms and Pauldrons
+  [-0.45 * widthMod, 0.45 * widthMod].forEach((x, idx) => {
+    const arm = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.1, 0.8 * heightMod, 12), camoMat);
+    arm.name = idx === 0 ? 'Left Arm' : 'Right Arm';
+    arm.position.set(x, 1.3 * heightMod, 0);
+    group.add(arm);
+
+    if (prng.bool(0.7)) {
+      const pauldron = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.22, 0.16), armorMat);
+      pauldron.name = idx === 0 ? 'Left Shoulder Pauldron' : 'Right Shoulder Pauldron';
+      pauldron.position.set(x * 1.08, 1.62 * heightMod, 0);
+      group.add(pauldron);
+    }
+  });
+
+  // Legs & Knee pads
+  [-0.2 * widthMod, 0.2 * widthMod].forEach((x, idx) => {
+    const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.12, 0.95 * heightMod, 12), camoMat);
+    leg.name = idx === 0 ? 'Left Leg' : 'Right Leg';
+    leg.position.set(x, 0.48 * heightMod, 0);
+    group.add(leg);
+
+    const pad = new THREE.Mesh(new THREE.BoxGeometry(0.17, 0.2, 0.08), armorMat);
+    pad.name = idx === 0 ? 'Left Knee Pad' : 'Right Knee Pad';
+    pad.position.set(x, 0.48 * heightMod, 0.13);
+    group.add(pad);
+  });
+
+  // Weapon in hand
+  const weaponType = prng.choice(['carbine', 'smg', 'blade']);
+  if (weaponType === 'carbine' || weaponType === 'smg') {
+    const gun = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.2, 0.8), armorMat);
+    gun.name = 'Tactical Carbine Weapon';
+    gun.position.set(0.48 * widthMod, 1.1 * heightMod, 0.35);
+    group.add(gun);
+
+    const gunGlow = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.04, 0.3), glowVisor);
+    gunGlow.position.set(0.48 * widthMod, 1.18 * heightMod, 0.35);
+    group.add(gunGlow);
+  }
+}
+
+/**
+ * Procedural Cyberpunk Android / Mecha / Automaton
+ */
+function buildCyberpunkAndroid(group: THREE.Group, prng: ReturnType<typeof createPRNG>) {
+  const chassisPalettes = [
+    [0x0f172a, 0x1e293b, 0x00f0ff], // Obsidian Cyan
+    [0x18181b, 0x27272a, 0xf43f5e], // Matte Black Crimson
+    [0xe2e8f0, 0x94a3b8, 0x3b82f6], // Titanium White Azure
+    [0x1c1917, 0x78350f, 0xf59e0b], // Steampunk Bronze Gold
+  ];
+  const [baseCol, secCol, glowCol] = prng.choice(chassisPalettes);
+
+  const mainMat = new THREE.MeshStandardMaterial({ color: baseCol, metalness: 0.9, roughness: 0.2 });
+  const secMat = new THREE.MeshStandardMaterial({ color: secCol, metalness: 0.8, roughness: 0.4 });
+  const glowMat = new THREE.MeshStandardMaterial({ color: glowCol, emissive: glowCol, emissiveIntensity: 1.8 });
+
+  // Android Chassis Torso
+  const chest = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.9, 0.45), mainMat);
+  chest.name = 'Mecha Chassis Core';
+  chest.position.y = 1.4;
+  group.add(chest);
+
+  // Exposed Energy Core Reactor
+  const reactor = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.16, 0.12, 16), glowMat);
+  reactor.rotateX(Math.PI / 2);
+  reactor.name = 'Arc Energy Core';
+  reactor.position.set(0, 1.45, 0.24);
+  group.add(reactor);
+
+  // Cybernetic Head
+  const head = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.44, 0.42), secMat);
+  head.name = 'Android Processor Head';
+  head.position.y = 2.05;
+  group.add(head);
+
+  // Optical Sensor Array
+  const eyeStyle = prng.choice(['mono', 'dual', 'visorslit']);
+  if (eyeStyle === 'mono') {
+    const eye = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.09, 0.1, 16), glowMat);
+    eye.rotateX(Math.PI / 2);
+    eye.name = 'Central Optical Sensor';
+    eye.position.set(0, 2.08, 0.22);
+    group.add(eye);
+  } else {
+    [-0.1, 0.1].forEach((x, i) => {
+      const eye = new THREE.Mesh(new THREE.SphereGeometry(0.05, 12, 12), glowMat);
+      eye.name = `Bionic Optical Eye ${i + 1}`;
+      eye.position.set(x, 2.08, 0.22);
+      group.add(eye);
+    });
+  }
+
+  // Antenna / Sensor Fin
+  const fin = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.35, 0.18), secMat);
+  fin.name = 'Comms Uplink Fin';
+  fin.position.set(0.24, 2.25, -0.05);
+  group.add(fin);
+
+  // Hydraulic Limbs
+  [-0.48, 0.48].forEach((x, i) => {
+    const arm = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.08, 0.85, 12), secMat);
+    arm.name = i === 0 ? 'Left Servo Arm' : 'Right Servo Arm';
+    arm.position.set(x, 1.35, 0);
+    group.add(arm);
+
+    // Shoulder Cannon or Vent
+    if (i === 1 && prng.bool(0.7)) {
+      const cannon = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.08, 0.6, 12), mainMat);
+      cannon.rotateX(Math.PI / 2);
+      cannon.name = 'Shoulder Particle Cannon';
+      cannon.position.set(x, 1.75, 0.1);
+      group.add(cannon);
+    }
+  });
+
+  [-0.22, 0.22].forEach((x, i) => {
+    const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.1, 1.0, 12), mainMat);
+    leg.name = i === 0 ? 'Left Bionic Leg' : 'Right Bionic Leg';
+    leg.position.set(x, 0.5, 0);
+    group.add(leg);
+  });
+}
+
+/**
+ * Procedural Medieval Knight / Paladin / Crusader
+ */
+function buildKnightPaladin(group: THREE.Group, prng: ReturnType<typeof createPRNG>) {
+  const steelTints = [0xd1d5db, 0x9ca3af, 0x64748b, 0x334155];
+  const goldTints = [0xf59e0b, 0xd97706, 0xeab308, 0xfbbf24];
+  const clothTints = [0x1e3a8a, 0x991b1b, 0x065f46, 0x581c87, 0x1e293b];
+
+  const steelColor = prng.color(steelTints);
+  const goldColor = prng.color(goldTints);
+  const clothColor = prng.color(clothTints);
+
+  const steelMat = new THREE.MeshStandardMaterial({ color: steelColor, metalness: 0.92, roughness: 0.2 });
+  const goldMat = new THREE.MeshStandardMaterial({ color: goldColor, metalness: 0.88, roughness: 0.3 });
+  const clothMat = new THREE.MeshStandardMaterial({ color: clothColor, roughness: 0.8 });
+
+  // Breastplate
+  const cuirass = new THREE.Mesh(new THREE.CylinderGeometry(0.38, 0.3, 0.85, 16), steelMat);
+  cuirass.name = 'Steel Cuirass Breastplate';
+  cuirass.position.y = 1.35;
+  group.add(cuirass);
+
+  // Gorget collar
+  const gorget = new THREE.Mesh(new THREE.TorusGeometry(0.26, 0.05, 12, 24), goldMat);
+  gorget.rotateX(Math.PI / 2);
+  gorget.name = 'Ornate Gilded Gorget';
+  gorget.position.y = 1.78;
+  group.add(gorget);
+
+  // Tabard
+  const tabard = new THREE.Mesh(new THREE.PlaneGeometry(0.4, 0.95), clothMat);
+  tabard.name = 'Heraldic Tabard';
+  tabard.position.set(0, 1.25, 0.26);
+  group.add(tabard);
+
+  // Helm style
+  const helmStyle = prng.choice(['greathelm', 'winged', 'barbuta']);
+  const helm = new THREE.Mesh(new THREE.CylinderGeometry(0.24, 0.26, 0.38, 16), steelMat);
+  helm.name = 'Knight Battle Greathelm';
+  helm.position.y = 2.05;
+  group.add(helm);
+
+  // Visor Slit
+  const slit = new THREE.Mesh(new THREE.BoxGeometry(0.26, 0.04, 0.1), new THREE.MeshBasicMaterial({ color: 0x0f172a }));
+  slit.name = 'Visor Eye Slit';
+  slit.position.set(0, 2.05, 0.22);
+  group.add(slit);
+
+  if (helmStyle === 'winged') {
+    [-0.26, 0.26].forEach((x, i) => {
+      const wing = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.35, 0.22), goldMat);
+      wing.name = `Helm Wing Crest ${i + 1}`;
+      wing.position.set(x, 2.25, 0);
+      group.add(wing);
+    });
+  } else {
+    const crest = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.24, 0.4), goldMat);
+    crest.name = 'Gilded Helm Crest';
+    crest.position.set(0, 2.3, 0);
+    group.add(crest);
+  }
+
+  // Pauldrons
+  [-0.45, 0.45].forEach((x, i) => {
+    const pauldron = new THREE.Mesh(new THREE.SphereGeometry(0.22, 16, 12), steelMat);
+    pauldron.name = i === 0 ? 'Left Armored Pauldron' : 'Right Armored Pauldron';
+    pauldron.position.set(x, 1.68, 0);
+    group.add(pauldron);
+  });
+
+  // Legs
+  [-0.2, 0.2].forEach((x, i) => {
+    const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.11, 0.95, 12), steelMat);
+    leg.name = i === 0 ? 'Left Steel Greave' : 'Right Steel Greave';
+    leg.position.set(x, 0.48, 0);
+    group.add(leg);
+  });
+
+  // Weapon: Sword vs Warhammer
+  const weapon = prng.choice(['sword', 'warhammer']);
+  if (weapon === 'sword') {
+    const swordBlade = new THREE.Mesh(new THREE.BoxGeometry(0.08, 1.35, 0.02), steelMat);
+    swordBlade.name = 'Knightly Longsword Blade';
+    swordBlade.position.set(0.65, 1.25, 0.1);
+    group.add(swordBlade);
+
+    const crossguard = new THREE.Mesh(new THREE.BoxGeometry(0.36, 0.06, 0.06), goldMat);
+    crossguard.name = 'Sword Crossguard';
+    crossguard.position.set(0.65, 0.6, 0.1);
+    group.add(crossguard);
+  } else {
+    const shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, 1.4, 12), goldMat);
+    shaft.name = 'Warhammer Shaft';
+    shaft.position.set(0.65, 1.1, 0.1);
+    group.add(shaft);
+
+    const head = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.25, 0.25), steelMat);
+    head.name = 'Heavy Warhammer Head';
+    head.position.set(0.65, 1.65, 0.1);
+    group.add(head);
+  }
+
+  // Shield
+  const shield = new THREE.Mesh(new THREE.BoxGeometry(0.45, 0.85, 0.06), clothMat);
+  shield.name = 'Heraldic Kite Shield';
+  shield.position.set(-0.62, 1.2, 0.2);
+  shield.rotateY(0.2);
+  group.add(shield);
+
+  const shieldBoss = new THREE.Mesh(new THREE.SphereGeometry(0.1, 12, 12), goldMat);
+  shieldBoss.name = 'Golden Shield Boss';
+  shieldBoss.position.set(-0.62, 1.2, 0.24);
+  group.add(shieldBoss);
+}
+
+/**
+ * Procedural Mage / Wizard / Sorcerer
+ */
+function buildMageWizard(group: THREE.Group, prng: ReturnType<typeof createPRNG>) {
+  const robeColors = [0x4c1d95, 0x1e1b4b, 0x701a75, 0x064e3b, 0x831843];
+  const crystalColors = [0xa855f7, 0x06b6d4, 0x3b82f6, 0x10b981, 0xf59e0b];
+
+  const robeColor = prng.color(robeColors);
+  const crystalColor = prng.color(crystalColors);
+
+  const robeMat = new THREE.MeshStandardMaterial({ color: robeColor, roughness: 0.75 });
+  const trimMat = new THREE.MeshStandardMaterial({ color: 0xf59e0b, metalness: 0.7, roughness: 0.3 });
+  const woodMat = new THREE.MeshStandardMaterial({ color: 0x78350f, roughness: 0.9 });
+  const arcaneGlow = new THREE.MeshStandardMaterial({ color: crystalColor, emissive: crystalColor, emissiveIntensity: 1.6 });
+
+  // Robe Skirt
+  const skirt = new THREE.Mesh(new THREE.ConeGeometry(0.58, 1.2, 16), robeMat);
+  skirt.name = 'Mystic Robe Skirt';
+  skirt.position.y = 0.6;
+  group.add(skirt);
+
+  // Upper Robe Torso
+  const torso = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.35, 0.75, 16), robeMat);
+  torso.name = 'Arcane Robe Torso';
+  torso.position.y = 1.35;
+  group.add(torso);
+
+  // Cowl
+  const cowl = new THREE.Mesh(new THREE.ConeGeometry(0.48, 0.3, 16), trimMat);
+  cowl.name = 'Gold Trim Cowl';
+  cowl.position.y = 1.7;
+  group.add(cowl);
+
+  // Pointed Wizard Hat
+  const hatBrim = new THREE.Mesh(new THREE.CylinderGeometry(0.48, 0.5, 0.04, 24), robeMat);
+  hatBrim.name = 'Wizard Hat Brim';
+  hatBrim.position.y = 2.05;
+  group.add(hatBrim);
+
+  const hatCone = new THREE.Mesh(new THREE.ConeGeometry(0.3, 0.7, 16), robeMat);
+  hatCone.name = 'Pointed Arcane Cone';
+  hatCone.position.set(-0.04, 2.45, 0);
+  hatCone.rotateZ(-0.15);
+  group.add(hatCone);
+
+  // Staff
+  const staff = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.035, 2.2, 12), woodMat);
+  staff.name = 'Elderwood Staff';
+  staff.position.set(0.62, 1.1, 0.2);
+  group.add(staff);
+
+  // Staff Crystal
+  const crystal = new THREE.Mesh(new THREE.OctahedronGeometry(0.2, 0), arcaneGlow);
+  crystal.name = 'Arcane Elemental Focus';
+  crystal.position.set(0.62, 2.22, 0.2);
+  group.add(crystal);
+
+  // Orbiting Arcane Runes (3 to 5)
+  const runeCount = prng.int(3, 5);
+  for (let i = 0; i < runeCount; i++) {
+    const angle = (i * Math.PI * 2) / runeCount;
+    const orb = new THREE.Mesh(new THREE.SphereGeometry(0.06, 12, 12), arcaneGlow);
+    orb.name = `Orbiting Rune ${i + 1}`;
+    orb.position.set(0.62 + Math.cos(angle) * 0.3, 2.22 + Math.sin(angle * 2) * 0.1, 0.2 + Math.sin(angle) * 0.3);
+    group.add(orb);
+  }
+}
+
+/**
+ * Procedural Dragon / Monster / Beast
+ */
+function buildDragonMonster(group: THREE.Group, prng: ReturnType<typeof createPRNG>) {
+  const scaleColors = [0x991b1b, 0x1e3a8a, 0x065f46, 0x312e81, 0x1f2937, 0x854d0e];
+  const eyeColors = [0xfacc15, 0xef4444, 0x00f0ff, 0x10b981];
+
+  const scaleColor = prng.color(scaleColors);
+  const eyeColor = prng.color(eyeColors);
+
+  const scaleMat = new THREE.MeshStandardMaterial({ color: scaleColor, roughness: 0.65 });
+  const hornMat = new THREE.MeshStandardMaterial({ color: 0x111827, roughness: 0.4 });
+  const eyeMat = new THREE.MeshStandardMaterial({ color: eyeColor, emissive: eyeColor, emissiveIntensity: 1.8 });
+  const wingMat = new THREE.MeshStandardMaterial({ color: scaleColor, roughness: 0.8, side: THREE.DoubleSide });
+
+  // Body Torso
+  const body = new THREE.Mesh(new THREE.BoxGeometry(0.85, 0.7, 1.4), scaleMat);
+  body.name = 'Dragon Torso Body';
+  body.position.y = 0.95;
+  group.add(body);
+
+  // Neck & Snout
+  const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.28, 0.7, 12), scaleMat);
+  neck.name = 'Serpentine Neck';
+  neck.position.set(0, 1.45, 0.65);
+  neck.rotateX(-0.4);
+  group.add(neck);
+
+  const head = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.3, 0.6), scaleMat);
+  head.name = 'Reptilian Head';
+  head.position.set(0, 1.8, 0.95);
+  group.add(head);
+
+  // Horns
+  [-0.16, 0.16].forEach((x, i) => {
+    const horn = new THREE.Mesh(new THREE.ConeGeometry(0.06, 0.48, 8), hornMat);
+    horn.name = `Draconic Horn ${i + 1}`;
+    horn.position.set(x, 2.08, 0.85);
+    horn.rotateX(-0.5);
+    group.add(horn);
+  });
+
+  // Glowing Eyes
+  [-0.18, 0.18].forEach((x, i) => {
+    const eye = new THREE.Mesh(new THREE.SphereGeometry(0.05, 8, 8), eyeMat);
+    eye.name = `Fiery Eye ${i + 1}`;
+    eye.position.set(x, 1.85, 1.2);
+    group.add(eye);
+  });
+
+  // Wings
+  [-1, 1].forEach(side => {
+    const wingBone = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.03, 1.5, 8), hornMat);
+    wingBone.name = side === -1 ? 'Left Wing Spar' : 'Right Wing Spar';
+    wingBone.position.set(side * 0.9, 1.5, -0.1);
+    wingBone.rotateZ(side * 0.8);
+    group.add(wingBone);
+
+    const wingMembrane = new THREE.Mesh(new THREE.PlaneGeometry(1.2, 0.9), wingMat);
+    wingMembrane.name = side === -1 ? 'Left Wing Membrane' : 'Right Wing Membrane';
+    wingMembrane.position.set(side * 1.1, 1.4, -0.2);
+    wingMembrane.rotateY(side * 0.3);
+    group.add(wingMembrane);
+  });
+
+  // Spiked Tail
+  const tail = new THREE.Mesh(new THREE.ConeGeometry(0.18, 1.4, 10), scaleMat);
+  tail.name = 'Spiked Tail';
+  tail.position.set(0, 0.8, -1.25);
+  tail.rotateX(Math.PI / 2 + 0.3);
+  group.add(tail);
+
+  // 4 Legs
+  [
+    [-0.45, 0.45, 0.45],
+    [0.45, 0.45, 0.45],
+    [-0.45, 0.45, -0.45],
+    [0.45, 0.45, -0.45]
+  ].forEach(([x, y, z], idx) => {
+    const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.1, 0.7, 10), scaleMat);
+    leg.name = `Clawed Limb ${idx + 1}`;
+    leg.position.set(x, y, z);
+    group.add(leg);
+  });
+}
+
+/**
+ * Procedural Necrotic Mutant Zombie / Bio-Mechanical Apex Creature
+ * Directly matches high-fidelity Unreal Engine 5 creature art with:
+ * - Exposed striated crimson muscle fibers and calcified bone ribcage
+ * - Glowing dorsal spinal vertebrae nodes (emissive orange #f59e0b)
+ * - Jagged bone carapace pauldrons with protruding dorsal & forearm spikes
+ * - Hunched predatory posture with elongated clawed arms and talon hands
+ * - Sunken skull cranium with bared fanged jaw
+ */
+function buildNecroticMutantZombie(group: THREE.Group, prng: ReturnType<typeof createPRNG>) {
+  // PBR Shaders
+  const fleshMat = new THREE.MeshStandardMaterial({ 
+    color: 0x881337, 
+    roughness: 0.7, 
+    metalness: 0.15 
+  });
+  const darkFleshMat = new THREE.MeshStandardMaterial({ 
+    color: 0x4c0519, 
+    roughness: 0.85, 
+    metalness: 0.1 
+  });
+  const boneMat = new THREE.MeshStandardMaterial({ 
+    color: 0xd4d4d8, 
+    roughness: 0.45, 
+    metalness: 0.25 
+  });
+  const darkChitinMat = new THREE.MeshStandardMaterial({ 
+    color: 0x27272a, 
+    roughness: 0.35, 
+    metalness: 0.4 
+  });
+  const nodeGlowMat = new THREE.MeshStandardMaterial({ 
+    color: 0xf59e0b, 
+    emissive: 0xf59e0b, 
+    emissiveIntensity: 2.2, 
+    roughness: 0.15 
+  });
+  const toothMat = new THREE.MeshStandardMaterial({ 
+    color: 0xfef08a, 
+    roughness: 0.3 
+  });
+
+  const scaleY = prng.range(0.95, 1.1);
+
+  // 1. Pelvis & Abdominal Core (Hunched Forward)
+  const pelvis = new THREE.Mesh(new THREE.CapsuleGeometry(0.24, 0.3, 8, 12), darkFleshMat);
+  pelvis.name = 'Necrotic Pelvis';
+  pelvis.position.set(0, 1.05 * scaleY, -0.05);
+  pelvis.rotation.set(0.3, 0, 0);
+  group.add(pelvis);
+
+  // 2. Muscular Thorax / Torso (Angled Forward 35°)
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.7, 0.4), fleshMat);
+  torso.name = 'Striated Muscular Torso';
+  torso.position.set(0, 1.45 * scaleY, 0.18);
+  torso.rotation.set(0.4, 0, 0);
+  group.add(torso);
+
+  // 3. Calcified Ribcage Armor (6 bone ribs curving over exposed muscle)
+  for (let i = 0; i < 4; i++) {
+    const yOffset = 1.35 * scaleY + i * 0.12;
+    const zOffset = 0.12 + i * 0.05;
+    const ribWidth = 0.58 - i * 0.04;
+
+    [-1, 1].forEach((side) => {
+      const rib = new THREE.Mesh(new THREE.TorusGeometry(ribWidth / 2, 0.025, 8, 16, Math.PI * 0.8), boneMat);
+      rib.name = `Calcified Rib ${i + 1} ${side === -1 ? 'L' : 'R'}`;
+      rib.position.set(side * 0.08, yOffset, zOffset);
+      rib.rotation.set(0.4, side * 0.3, side * 0.2);
+      group.add(rib);
+    });
+  }
+
+  // 4. Dorsal Spine with 6 Glowing Energy Nodes
+  for (let i = 0; i < 6; i++) {
+    const t = i / 5;
+    const y = 1.15 * scaleY + t * 0.75;
+    const z = -0.15 + Math.sin(t * Math.PI) * 0.32;
+
+    // Bone Vertebra
+    const vertebra = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.08, 0.12), darkChitinMat);
+    vertebra.name = `Dorsal Vertebra ${i + 1}`;
+    vertebra.position.set(0, y, z);
+    vertebra.rotation.set(0.4, 0, 0);
+    group.add(vertebra);
+
+    // Glowing Node/Canister (Orange Luminescence)
+    const node = new THREE.Mesh(new THREE.SphereGeometry(0.045, 12, 12), nodeGlowMat);
+    node.name = `Spinal Bio-Node ${i + 1}`;
+    node.position.set(0, y + 0.02, z - 0.06);
+    group.add(node);
+
+    // Lateral Bone Spurs on Upper Vertebrae
+    if (i >= 2) {
+      [-1, 1].forEach((side) => {
+        const spur = new THREE.Mesh(new THREE.ConeGeometry(0.025, 0.22, 6), darkChitinMat);
+        spur.name = `Dorsal Spike ${i + 1} ${side === -1 ? 'L' : 'R'}`;
+        spur.position.set(side * 0.12, y + 0.06, z - 0.02);
+        spur.rotation.set(0.5, side * 0.4, side * -0.7);
+        group.add(spur);
+      });
+    }
+  }
+
+  // 5. Heavy Bone Carapace Shoulders & Clavicle Pauldrons
+  [-1, 1].forEach((side) => {
+    const pauldron = new THREE.Mesh(new THREE.BoxGeometry(0.25, 0.22, 0.3), darkChitinMat);
+    pauldron.name = `Carapace Pauldron ${side === -1 ? 'Left' : 'Right'}`;
+    pauldron.position.set(side * 0.38, 1.72 * scaleY, 0.22);
+    pauldron.rotation.set(0.35, 0, side * -0.3);
+    group.add(pauldron);
+
+    // Protruding Pauldron Spikes
+    for (let s = 0; s < 2; s++) {
+      const spike = new THREE.Mesh(new THREE.ConeGeometry(0.04, 0.28, 6), boneMat);
+      spike.name = `Pauldron Spike ${side === -1 ? 'L' : 'R'}_${s + 1}`;
+      spike.position.set(side * (0.42 + s * 0.08), 1.82 * scaleY + s * 0.05, 0.2 - s * 0.08);
+      spike.rotation.set(0.2, side * 0.3, side * -0.8);
+      group.add(spike);
+    }
+  });
+
+  // 6. Skull Head & Fanged Jaws (Hunched Forward)
+  const headGroup = new THREE.Group();
+  headGroup.name = 'Necrotic Skull Unit';
+  headGroup.position.set(0, 1.88 * scaleY, 0.55);
+
+  // Cranium
+  const cranium = new THREE.Mesh(new THREE.SphereGeometry(0.18, 16, 16), boneMat);
+  cranium.name = 'Cranium';
+  cranium.scale.set(0.9, 1.0, 1.15);
+  cranium.rotation.set(0.25, 0, 0);
+  headGroup.add(cranium);
+
+  // Brow Ridge
+  const brow = new THREE.Mesh(new THREE.BoxGeometry(0.26, 0.06, 0.12), darkChitinMat);
+  brow.name = 'Brow Ridge';
+  brow.position.set(0, 0.05, 0.14);
+  headGroup.add(brow);
+
+  // Sunken Hollow Eye Sockets
+  [-0.07, 0.07].forEach((x, idx) => {
+    const eye = new THREE.Mesh(new THREE.SphereGeometry(0.035, 8, 8), darkFleshMat);
+    eye.name = `Hollow Eye Socket ${idx + 1}`;
+    eye.position.set(x, 0.02, 0.16);
+    headGroup.add(eye);
+  });
+
+  // Snarling Jaw & Teeth
+  const jaw = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.1, 0.18), darkFleshMat);
+  jaw.name = 'Mandible Jaw';
+  jaw.position.set(0, -0.12, 0.1);
+  headGroup.add(jaw);
+
+  // Upper & Lower Teeth
+  const teethUpper = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.03, 0.06), toothMat);
+  teethUpper.position.set(0, -0.06, 0.18);
+  headGroup.add(teethUpper);
+
+  const teethLower = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.03, 0.06), toothMat);
+  teethLower.position.set(0, -0.1, 0.17);
+  headGroup.add(teethLower);
+
+  group.add(headGroup);
+
+  // 7. Elongated Predatory Arms (Hunched / Ground-Reaching)
+  [-1, 1].forEach((side) => {
+    // Upper Arm (Bicep/Tricep)
+    const upperArm = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.07, 0.65, 10), fleshMat);
+    upperArm.name = `${side === -1 ? 'Left' : 'Right'} Upper Arm`;
+    upperArm.position.set(side * 0.45, 1.5 * scaleY, 0.32);
+    upperArm.rotation.set(0.6, 0, side * 0.2);
+    group.add(upperArm);
+
+    // Forearm with Bone Chitin Ridge
+    const forearm = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.05, 0.75, 10), fleshMat);
+    forearm.name = `${side === -1 ? 'Left' : 'Right'} Forearm`;
+    forearm.position.set(side * 0.52, 1.0 * scaleY, 0.58);
+    forearm.rotation.set(0.75, side * 0.1, side * -0.15);
+    group.add(forearm);
+
+    // Forearm Bone Blades (2 jagged spurs on ulna)
+    for (let b = 0; b < 2; b++) {
+      const blade = new THREE.Mesh(new THREE.ConeGeometry(0.03, 0.2, 5), darkChitinMat);
+      blade.name = `Ulna Bone Spur ${side === -1 ? 'L' : 'R'}_${b + 1}`;
+      blade.position.set(side * 0.58, 1.05 * scaleY - b * 0.18, 0.62);
+      blade.rotation.set(0.9, 0, side * -1.0);
+      group.add(blade);
+    }
+
+    // Extended 5-Talon Claw Hand
+    const hand = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.08, 0.14), darkFleshMat);
+    hand.name = `${side === -1 ? 'Left' : 'Right'} Claw Palm`;
+    hand.position.set(side * 0.55, 0.58 * scaleY, 0.82);
+    hand.rotation.set(0.4, 0, 0);
+    group.add(hand);
+
+    // 4 Long Sharp Finger Talons + 1 Thumb Talon
+    for (let f = 0; f < 4; f++) {
+      const fx = -0.045 + f * 0.03;
+      const claw = new THREE.Mesh(new THREE.ConeGeometry(0.018, 0.24, 6), darkChitinMat);
+      claw.name = `Talon Finger ${side === -1 ? 'L' : 'R'}_${f + 1}`;
+      claw.position.set(side * 0.55 + fx, 0.48 * scaleY, 0.92);
+      claw.rotation.set(1.1, 0, 0);
+      group.add(claw);
+    }
+  });
+
+  // 8. Muscular Digitigrade Legs (Predatory Stance)
+  [-1, 1].forEach((side) => {
+    // Muscular Thigh
+    const thigh = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.1, 0.6, 12), fleshMat);
+    thigh.name = `${side === -1 ? 'Left' : 'Right'} Thigh`;
+    thigh.position.set(side * 0.28, 0.82 * scaleY, -0.05);
+    thigh.rotation.set(-0.5, 0, side * -0.15);
+    group.add(thigh);
+
+    // Knee Cap
+    const knee = new THREE.Mesh(new THREE.SphereGeometry(0.08, 10, 10), boneMat);
+    knee.name = `${side === -1 ? 'Left' : 'Right'} Knee Armor`;
+    knee.position.set(side * 0.32, 0.58 * scaleY, 0.18);
+    group.add(knee);
+
+    // Muscular Calf / Shin (Digitigrade)
+    const calf = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.06, 0.62, 10), fleshMat);
+    calf.name = `${side === -1 ? 'Left' : 'Right'} Shin`;
+    calf.position.set(side * 0.32, 0.32 * scaleY, 0.02);
+    calf.rotation.set(0.45, 0, side * 0.1);
+    group.add(calf);
+
+    // Clawed Foot
+    const foot = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.06, 0.28), darkChitinMat);
+    foot.name = `${side === -1 ? 'Left' : 'Right'} Foot`;
+    foot.position.set(side * 0.34, 0.03, 0.08);
+    group.add(foot);
+
+    // Toe Claws
+    for (let tc = 0; tc < 3; tc++) {
+      const toeClaw = new THREE.Mesh(new THREE.ConeGeometry(0.02, 0.1, 5), darkChitinMat);
+      toeClaw.name = `Toe Claw ${side === -1 ? 'L' : 'R'}_${tc + 1}`;
+      toeClaw.position.set(side * 0.34 + (-0.035 + tc * 0.035), 0.03, 0.24);
+      toeClaw.rotation.set(Math.PI / 2, 0, 0);
+      group.add(toeClaw);
+    }
+  });
+}
+
+/**
+ * Universal Character Model router that parses prompts and applies PRNG variations.
+ */
+export function buildCharacter3DModel(prompt: string, seed?: string | number): THREE.Group {
+  const group = new THREE.Group();
+  group.name = 'Character_3D_Model';
+
+  const prng = createPRNG(seed || `${prompt}_${Date.now()}_${Math.random()}`);
+  const p = prompt.toLowerCase();
+
+  if (
+    p.includes('zombie') || 
+    p.includes('mutant') || 
+    p.includes('undead') || 
+    p.includes('ghoul') || 
+    p.includes('necrotic') || 
+    p.includes('infected') ||
+    p.includes('cannibal') ||
+    p.includes('abomination')
+  ) {
+    buildNecroticMutantZombie(group, prng);
+  } else if (p.includes('knight') || p.includes('paladin') || p.includes('medieval') || p.includes('crusader') || p.includes('warrior')) {
+    buildKnightPaladin(group, prng);
+  } else if (p.includes('wizard') || p.includes('mage') || p.includes('sorcerer') || p.includes('witch') || p.includes('spell') || p.includes('magic')) {
+    buildMageWizard(group, prng);
+  } else if (p.includes('dragon') || p.includes('monster') || p.includes('beast') || p.includes('creature') || p.includes('demon') || p.includes('boss')) {
+    buildDragonMonster(group, prng);
+  } else if (p.includes('robot') || p.includes('android') || p.includes('mecha') || p.includes('cyber') || p.includes('automaton') || p.includes('cyborg') || p.includes('droid')) {
+    buildCyberpunkAndroid(group, prng);
+  } else {
+    // Spec-ops / tactical operative / sci-fi soldier
+    buildTacticalPointman(group, prng);
+  }
+
+  // Decorative Ground Pedestal
+  const base = new THREE.Mesh(
+    new THREE.CylinderGeometry(1.5, 1.6, 0.08, 32),
+    new THREE.MeshStandardMaterial({ color: 0x0f172a, roughness: 0.9, metalness: 0.2 })
+  );
+  base.name = 'Character Display Pedestal';
+  base.position.y = -0.04;
+  group.add(base);
+
+  // Auto-rig character with Mesh2Motion
+  try {
+    const rigType: RigType = (
+      p.includes('dragon') || 
+      p.includes('monster') || 
+      p.includes('beast') || 
+      p.includes('creature') ||
+      p.includes('zombie') ||
+      p.includes('mutant') ||
+      p.includes('undead')
+    ) 
+      ? 'creature' 
+      : (p.includes('robot') || p.includes('mecha') || p.includes('droid'))
+        ? 'mech'
+        : 'humanoid';
+    const rigged = Mesh2MotionEngine.rigAndAnimate(group, rigType);
+    (rigged.riggedGroup as any).animations = rigged.clips.map(c => c.clip);
+    (rigged.riggedGroup as any).__mesh2motion = rigged;
+    return rigged.riggedGroup;
+  } catch (err) {
+    console.warn('Mesh2Motion auto-rig procedural fallback:', err);
+  }
+
+  return group;
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic Procedural Prop Generators
+// ---------------------------------------------------------------------------
+
+/**
+ * Procedural Melee Weapon (Sword, Katana, Axe, Hammer, Spear, Scythe)
+ */
+function buildMeleeWeaponProp(group: THREE.Group, prompt: string, prng: ReturnType<typeof createPRNG>) {
+  const p = prompt.toLowerCase();
+  const steelTints = [0xe2e8f0, 0xcfd8dc, 0x94a3b8, 0x334155, 0x1e293b];
+  const goldTints = [0xf59e0b, 0xd97706, 0xeab308, 0xb45309];
+  const leatherTints = [0x451a03, 0x78350f, 0x27272a, 0x1c1917];
+  const glowTints = [0x06b6d4, 0x10b981, 0x8b5cf6, 0xef4444, 0xf59e0b, 0x00f0ff];
+
+  const steelMat = new THREE.MeshStandardMaterial({
+    color: prng.color(steelTints),
+    metalness: prng.range(0.85, 0.98),
+    roughness: prng.range(0.1, 0.3)
+  });
+  const goldMat = new THREE.MeshStandardMaterial({
+    color: prng.color(goldTints),
+    metalness: 0.9,
+    roughness: 0.25
+  });
+  const leatherMat = new THREE.MeshStandardMaterial({
+    color: prng.color(leatherTints),
+    roughness: 0.85
+  });
+  const runeGlow = new THREE.MeshStandardMaterial({
+    color: prng.color(glowTints),
+    emissive: prng.color(glowTints),
+    emissiveIntensity: prng.range(1.2, 1.8)
+  });
+
+  if (p.includes('axe') || p.includes('battleaxe')) {
+    // Battle Axe
+    const haftLength = prng.range(1.3, 1.7);
+    const haft = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.045, haftLength, 16), leatherMat);
+    haft.name = 'Axe Haft';
+    haft.position.y = haftLength / 2;
+    group.add(haft);
+
+    const isDoubleBlade = prng.bool(0.65);
+    const bladeSides = isDoubleBlade ? [-1, 1] : [1];
+    const bladeW = prng.range(0.38, 0.55);
+    const bladeH = prng.range(0.45, 0.65);
+
+    bladeSides.forEach(side => {
+      const bladeGeo = new THREE.BoxGeometry(bladeW, bladeH, 0.04);
+      bladeGeo.translate(side * (bladeW / 2 + 0.04), 0, 0);
+      const blade = new THREE.Mesh(bladeGeo, steelMat);
+      blade.name = side === 1 ? 'Right Axe Blade' : 'Left Axe Blade';
+      blade.position.y = haftLength * 0.88;
+      group.add(blade);
+
+      const rune = new THREE.Mesh(new THREE.BoxGeometry(bladeW * 0.6, 0.04, 0.048), runeGlow);
+      rune.position.set(side * (bladeW * 0.4), haftLength * 0.88, 0);
+      group.add(rune);
+    });
+
+    const topSpike = new THREE.Mesh(new THREE.ConeGeometry(0.06, 0.35, 12), goldMat);
+    topSpike.name = 'Axe Crown Spike';
+    topSpike.position.y = haftLength + 0.15;
+    group.add(topSpike);
+  } else if (p.includes('hammer') || p.includes('warhammer') || p.includes('mace')) {
+    // Heavy Warhammer / Mace
+    const haftLength = prng.range(1.2, 1.5);
+    const haft = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.05, haftLength, 16), leatherMat);
+    haft.name = 'Warhammer Shaft';
+    haft.position.y = haftLength / 2;
+    group.add(haft);
+
+    const headW = prng.range(0.4, 0.6);
+    const headH = prng.range(0.28, 0.38);
+    const headD = prng.range(0.26, 0.36);
+    const head = new THREE.Mesh(new THREE.BoxGeometry(headW, headH, headD), steelMat);
+    head.name = 'Warhammer Impact Head';
+    head.position.y = haftLength * 0.92;
+    group.add(head);
+
+    const runeInlay = new THREE.Mesh(new THREE.BoxGeometry(headW * 0.7, 0.05, headD + 0.02), runeGlow);
+    runeInlay.position.y = haftLength * 0.92;
+    group.add(runeInlay);
+
+    const rearSpike = new THREE.Mesh(new THREE.ConeGeometry(0.08, 0.35, 8), steelMat);
+    rearSpike.name = 'Armor Piercing Spike';
+    rearSpike.position.set(-headW / 2 - 0.15, haftLength * 0.92, 0);
+    rearSpike.rotateZ(Math.PI / 2);
+    group.add(rearSpike);
+  } else if (p.includes('spear') || p.includes('lance') || p.includes('halberd')) {
+    // Spear / Halberd
+    const shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.035, 2.2, 16), leatherMat);
+    shaft.name = 'Polearm Shaft';
+    shaft.position.y = 1.1;
+    group.add(shaft);
+
+    const tip = new THREE.Mesh(new THREE.ConeGeometry(0.1, 0.7, 12), steelMat);
+    tip.name = 'Spearhead Tip';
+    tip.position.y = 2.45;
+    group.add(tip);
+
+    const coll = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.07, 0.12, 16), goldMat);
+    coll.position.y = 2.15;
+    group.add(coll);
+  } else {
+    // Sword / Katana / Blade
+    const bladeLength = prng.range(1.4, 1.85);
+    const bladeWidth = prng.range(0.09, 0.14);
+    const blade = new THREE.Mesh(new THREE.BoxGeometry(bladeWidth, bladeLength, 0.025), steelMat);
+    blade.name = 'Forged Blade';
+    blade.position.y = 0.45 + bladeLength / 2;
+    group.add(blade);
+
+    // Glowing Rune Core Inlay
+    const rune = new THREE.Mesh(new THREE.BoxGeometry(bladeWidth * 0.3, bladeLength * 0.75, 0.03), runeGlow);
+    rune.name = 'Runic Core';
+    rune.position.y = 0.45 + bladeLength / 2;
+    group.add(rune);
+
+    // Crossguard
+    const guardWidth = prng.range(0.4, 0.65);
+    const guard = new THREE.Mesh(new THREE.BoxGeometry(guardWidth, 0.08, 0.09), goldMat);
+    guard.name = 'Ornate Crossguard';
+    guard.position.y = 0.44;
+    group.add(guard);
+
+    // Grip
+    const grip = new THREE.Mesh(new THREE.CylinderGeometry(0.038, 0.038, 0.38, 16), leatherMat);
+    grip.name = 'Leather Hilt Grip';
+    grip.position.y = 0.22;
+    group.add(grip);
+
+    // Pommel
+    const pommel = new THREE.Mesh(new THREE.SphereGeometry(0.08, 16, 16), goldMat);
+    pommel.name = 'Weighted Pommel';
+    pommel.position.y = 0.02;
+    group.add(pommel);
+  }
+}
+
+/**
+ * Procedural Potion / Flask / Consumable
+ */
+function buildPotionFlaskProp(group: THREE.Group, prompt: string, prng: ReturnType<typeof createPRNG>) {
+  const p = prompt.toLowerCase();
+  
+  let liquidColor = 0xef4444; // Default Health Red
+  let emissiveColor = 0xdc2626;
+  if (p.includes('mana') || p.includes('blue') || p.includes('energy') || p.includes('frost')) {
+    liquidColor = 0x3b82f6;
+    emissiveColor = 0x2563eb;
+  } else if (p.includes('stamina') || p.includes('poison') || p.includes('green') || p.includes('acid') || p.includes('venom')) {
+    liquidColor = 0x10b981;
+    emissiveColor = 0x059669;
+  } else if (p.includes('arcane') || p.includes('purple') || p.includes('elixir') || p.includes('void')) {
+    liquidColor = 0xa855f7;
+    emissiveColor = 0x9333ea;
+  } else if (p.includes('holy') || p.includes('gold') || p.includes('yellow') || p.includes('sun')) {
+    liquidColor = 0xfacc15;
+    emissiveColor = 0xeab308;
+  } else {
+    const pal = [0xef4444, 0x3b82f6, 0x10b981, 0xa855f7, 0xf59e0b, 0x06b6d4];
+    liquidColor = prng.color(pal);
+    emissiveColor = liquidColor;
+  }
+
+  const glassMat = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    metalness: 0.1,
+    roughness: 0.08,
+    transparent: true,
+    opacity: 0.4
+  });
+
+  const liquidMat = new THREE.MeshStandardMaterial({
+    color: liquidColor,
+    emissive: emissiveColor,
+    emissiveIntensity: 1.4,
+    roughness: 0.2
+  });
+
+  const corkMat = new THREE.MeshStandardMaterial({ color: 0x92400e, roughness: 0.9 });
+  const goldRingMat = new THREE.MeshStandardMaterial({ color: 0xf59e0b, metalness: 0.9, roughness: 0.2 });
+
+  const flaskShape = prng.choice(['round', 'conical', 'cylindrical']);
+
+  if (flaskShape === 'conical') {
+    const bulb = new THREE.Mesh(new THREE.ConeGeometry(0.65, 0.9, 24), glassMat);
+    bulb.name = 'Conical Alchemy Flask';
+    bulb.position.y = 0.55;
+    group.add(bulb);
+
+    const liquid = new THREE.Mesh(new THREE.ConeGeometry(0.58, 0.75, 20), liquidMat);
+    liquid.name = 'Alchemical Reagent';
+    liquid.position.y = 0.48;
+    group.add(liquid);
+
+    const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.16, 0.4, 20), glassMat);
+    neck.name = 'Glass Neck';
+    neck.position.y = 1.15;
+    group.add(neck);
+
+    const cork = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.12, 0.18, 16), corkMat);
+    cork.name = 'Cork Stopper';
+    cork.position.y = 1.38;
+    group.add(cork);
+  } else if (flaskShape === 'cylindrical') {
+    const tube = new THREE.Mesh(new THREE.CylinderGeometry(0.35, 0.35, 1.1, 24), glassMat);
+    tube.name = 'Cylindrical Phial';
+    tube.position.y = 0.65;
+    group.add(tube);
+
+    const liquid = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.3, 0.95, 20), liquidMat);
+    liquid.name = 'Radiant Serum';
+    liquid.position.y = 0.6;
+    group.add(liquid);
+
+    const cork = new THREE.Mesh(new THREE.CylinderGeometry(0.25, 0.22, 0.2, 16), corkMat);
+    cork.position.y = 1.25;
+    group.add(cork);
+  } else {
+    // Round bulb
+    const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.55, 24, 24), glassMat);
+    bulb.name = 'Glass Orb';
+    bulb.position.y = 0.6;
+    group.add(bulb);
+
+    const liquid = new THREE.Mesh(new THREE.SphereGeometry(0.48, 20, 20), liquidMat);
+    liquid.name = 'Glowing Liquid Core';
+    liquid.position.y = 0.55;
+    group.add(liquid);
+
+    const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.18, 0.45, 20), glassMat);
+    neck.name = 'Flask Neck';
+    neck.position.y = 1.15;
+    group.add(neck);
+
+    const rim = new THREE.Mesh(new THREE.TorusGeometry(0.2, 0.03, 12, 24), goldRingMat);
+    rim.rotateX(Math.PI / 2);
+    rim.name = 'Gilded Flask Collar';
+    rim.position.y = 1.38;
+    group.add(rim);
+
+    const cork = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.13, 0.2, 16), corkMat);
+    cork.name = 'Cork Stopper';
+    cork.position.y = 1.48;
+    group.add(cork);
+  }
+}
+
+/**
+ * Procedural Sci-Fi Vehicle / Speeder / Hovercraft
+ */
+function buildSpeederVehicleProp(group: THREE.Group, prng: ReturnType<typeof createPRNG>) {
+  const hullTints = [0x1e293b, 0x0f172a, 0x18181b, 0x334155, 0x475569];
+  const accentTints = [0x3b82f6, 0xef4444, 0xf59e0b, 0x10b981, 0x8b5cf6];
+  const glowTints = [0x00f0ff, 0x06b6d4, 0xf43f5e, 0xfbbf24];
+
+  const hullMat = new THREE.MeshStandardMaterial({
+    color: prng.color(hullTints),
+    metalness: prng.range(0.7, 0.92),
+    roughness: 0.3
+  });
+  const accentMat = new THREE.MeshStandardMaterial({
+    color: prng.color(accentTints),
+    metalness: 0.5,
+    roughness: 0.4
+  });
+  const glowMat = new THREE.MeshStandardMaterial({
+    color: prng.color(glowTints),
+    emissive: prng.color(glowTints),
+    emissiveIntensity: 1.6
+  });
+
+  const bodyLength = prng.range(2.0, 2.8);
+  const bodyWidth = prng.range(0.7, 1.0);
+
+  // Streamlined Fuselage
+  const body = new THREE.Mesh(new THREE.BoxGeometry(bodyWidth, 0.35, bodyLength), hullMat);
+  body.name = 'Speeder Chassis Hull';
+  body.position.y = 0.55;
+  group.add(body);
+
+  // Cockpit Canopy
+  const cockpit = new THREE.Mesh(new THREE.BoxGeometry(bodyWidth * 0.65, 0.22, bodyLength * 0.38), glowMat);
+  cockpit.name = 'Holographic Canopy Cockpit';
+  cockpit.position.set(0, 0.8, 0.1);
+  group.add(cockpit);
+
+  // Engines
+  const engineRadius = prng.range(0.16, 0.22);
+  [-bodyWidth * 0.7, bodyWidth * 0.7].forEach((x, idx) => {
+    const engine = new THREE.Mesh(new THREE.CylinderGeometry(engineRadius, engineRadius * 1.1, bodyLength * 0.65, 16), hullMat);
+    engine.rotateX(Math.PI / 2);
+    engine.name = `Ion Thruster Nacelle ${idx + 1}`;
+    engine.position.set(x, 0.55, -0.2);
+    group.add(engine);
+
+    const thruster = new THREE.Mesh(new THREE.CircleGeometry(engineRadius, 16), glowMat);
+    thruster.name = `Ion Exhaust Flame ${idx + 1}`;
+    thruster.position.set(x, 0.55, -bodyLength * 0.55);
+    group.add(thruster);
+  });
+
+  // Swept Winglets
+  [-1, 1].forEach(side => {
+    const wing = new THREE.Mesh(new THREE.BoxGeometry(0.65, 0.05, bodyLength * 0.4), accentMat);
+    wing.name = side === -1 ? 'Left Vector Wing' : 'Right Vector Wing';
+    wing.position.set(side * (bodyWidth * 0.85), 0.55, 0.3);
+    group.add(wing);
+  });
+}
+
+/**
+ * Procedural Dungeon Treasure Chest / Sci-Fi Loot Crate
+ */
+function buildTreasureChestProp(group: THREE.Group, prompt: string, prng: ReturnType<typeof createPRNG>) {
+  const p = prompt.toLowerCase();
+  const isSciFi = p.includes('sci-fi') || p.includes('cyber') || p.includes('tech') || p.includes('vault');
+
+  if (isSciFi) {
+    const metalMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, metalness: 0.9, roughness: 0.25 });
+    const accentMat = new THREE.MeshStandardMaterial({ color: 0x0284c7, metalness: 0.6, roughness: 0.3 });
+    const glowMat = new THREE.MeshStandardMaterial({ color: 0x00f0ff, emissive: 0x00f0ff, emissiveIntensity: 1.5 });
+
+    const baseBox = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.75, 0.9), metalMat);
+    baseBox.name = 'Encrypted Cargo Pod';
+    baseBox.position.y = 0.38;
+    group.add(baseBox);
+
+    // Glowing Lock Interface
+    const lock = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.16, 0.05), glowMat);
+    lock.name = 'Biometric Lock Array';
+    lock.position.set(0, 0.45, 0.47);
+    group.add(lock);
+
+    // Corner reinforcements
+    [-0.65, 0.65].forEach(x => {
+      [-0.4, 0.4].forEach(z => {
+        const pillar = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.8, 0.12), accentMat);
+        pillar.position.set(x, 0.4, z);
+        group.add(pillar);
+      });
+    });
+  } else {
+    // Fantasy Wood & Iron or Gilded Royal Chest
+    const isGoldChest = p.includes('gold') || p.includes('royal') || p.includes('legendary');
+    const woodColor = isGoldChest ? 0x831843 : 0x78350f;
+    const bandColor = isGoldChest ? 0xf59e0b : 0x374151;
+
+    const woodMat = new THREE.MeshStandardMaterial({ color: woodColor, roughness: 0.85 });
+    const bandMat = new THREE.MeshStandardMaterial({ color: bandColor, metalness: isGoldChest ? 0.9 : 0.7, roughness: 0.3 });
+    const goldMat = new THREE.MeshStandardMaterial({ color: 0xf59e0b, metalness: 0.9, roughness: 0.2 });
+
+    const baseBox = new THREE.Mesh(new THREE.BoxGeometry(1.3, 0.6, 0.85), woodMat);
+    baseBox.name = 'Loot Chest Base';
+    baseBox.position.y = 0.3;
+    group.add(baseBox);
+
+    const lidGeo = new THREE.CylinderGeometry(0.425, 0.425, 1.3, 16, 1, false, 0, Math.PI);
+    lidGeo.rotateZ(Math.PI / 2);
+    const lid = new THREE.Mesh(lidGeo, woodMat);
+    lid.name = 'Arched Chest Lid';
+    lid.position.set(0, 0.6, 0);
+    group.add(lid);
+
+    [-0.45, 0.45].forEach((x, idx) => {
+      const band = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.62, 0.88), bandMat);
+      band.name = `Reinforced Clasp Band ${idx + 1}`;
+      band.position.set(x, 0.3, 0);
+      group.add(band);
+    });
+
+    const lock = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.22, 0.12), goldMat);
+    lock.name = 'Ornate Master Keyhole';
+    lock.position.set(0, 0.52, 0.44);
+    group.add(lock);
+  }
+}
+
+/**
+ * Procedural Dynamic Firearm (Sniper, Assault Rifle, SMG, Shotgun, Pistol, Plasma Cannon)
+ */
+function buildDynamicFirearmProp(group: THREE.Group, prompt: string, prng: ReturnType<typeof createPRNG>) {
+  const p = prompt.toLowerCase();
+  const metalColors = [0x1f242d, 0x111827, 0x1e293b, 0x374151, 0x27272a];
+  const polyColors = [0x374151, 0x475569, 0x71717a, 0x52525b, 0x3f3f46];
+  const camoColors = [0x3f4e3f, 0x4a443a, 0x334155, 0x1e1e24];
+  const glowColors = [0x00f0ff, 0xef4444, 0x10b981, 0xf59e0b, 0xa855f7];
+
+  const metalMat = new THREE.MeshStandardMaterial({
+    color: prng.color(metalColors),
+    metalness: prng.range(0.85, 0.95),
+    roughness: 0.25
+  });
+  const polyMat = new THREE.MeshStandardMaterial({
+    color: prng.choice([prng.color(polyColors), prng.color(camoColors)]),
+    metalness: 0.3,
+    roughness: 0.65
+  });
+  const glowMat = new THREE.MeshStandardMaterial({
+    color: prng.color(glowColors),
+    emissive: prng.color(glowColors),
+    emissiveIntensity: 1.4
+  });
+
+  const isSniper = p.includes('sniper') || p.includes('dmr') || p.includes('long');
+  const isShotgun = p.includes('shotgun') || p.includes('pump');
+  const isPistol = p.includes('pistol') || p.includes('handgun') || p.includes('revolver');
+  const isPlasma = p.includes('plasma') || p.includes('laser') || p.includes('energy') || p.includes('blaster') || p.includes('sci-fi');
+
+  if (isPistol) {
+    // Sidearm / Handgun
+    const slide = new THREE.Mesh(new THREE.BoxGeometry(0.65, 0.16, 0.12), metalMat);
+    slide.name = 'Tactical Pistol Slide';
+    slide.position.set(0, 0.5, 0);
+    group.add(slide);
+
+    const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, 0.35, 12), metalMat);
+    barrel.rotateZ(Math.PI / 2);
+    barrel.position.set(0.35, 0.5, 0);
+    group.add(barrel);
+
+    const grip = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.38, 0.1), polyMat);
+    grip.rotateZ(-0.25);
+    grip.name = 'Polymer Grip';
+    grip.position.set(-0.15, 0.26, 0);
+    group.add(grip);
+
+    if (isPlasma) {
+      const emitter = new THREE.Mesh(new THREE.BoxGeometry(0.35, 0.04, 0.13), glowMat);
+      emitter.position.set(0.05, 0.52, 0);
+      group.add(emitter);
+    }
+  } else if (isShotgun) {
+    // Heavy Combat Shotgun
+    const receiver = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.24, 0.16), metalMat);
+    receiver.name = 'Heavy Breech Receiver';
+    receiver.position.set(0, 0.5, 0);
+    group.add(receiver);
+
+    // Thick twin barrel
+    const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.065, 0.065, 1.1, 16), metalMat);
+    barrel.rotateZ(Math.PI / 2);
+    barrel.name = 'Smoothbore Barrel';
+    barrel.position.set(0.85, 0.53, 0);
+    group.add(barrel);
+
+    const magTube = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 0.95, 16), metalMat);
+    magTube.rotateZ(Math.PI / 2);
+    magTube.position.set(0.8, 0.43, 0);
+    group.add(magTube);
+
+    const pump = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.18, 0.18), polyMat);
+    pump.name = 'Tactical Ribbed Forend Pump';
+    pump.position.set(0.65, 0.43, 0);
+    group.add(pump);
+
+    const stock = new THREE.Mesh(new THREE.BoxGeometry(0.65, 0.28, 0.12), polyMat);
+    stock.position.set(-0.7, 0.44, 0);
+    group.add(stock);
+  } else {
+    // Assault Rifle, Carbine, or Sniper
+    const barrelLength = isSniper ? prng.range(1.4, 1.8) : prng.range(0.9, 1.25);
+    const receiverW = isSniper ? 1.2 : 0.95;
+
+    // Receiver
+    const receiver = new THREE.Mesh(new THREE.BoxGeometry(receiverW, 0.25, 0.16), metalMat);
+    receiver.name = 'Milled Upper Receiver';
+    receiver.position.set(0, 0.5, 0);
+    group.add(receiver);
+
+    // Barrel
+    const barrelGeo = new THREE.CylinderGeometry(0.04, 0.04, barrelLength, 16);
+    barrelGeo.rotateZ(Math.PI / 2);
+    const barrel = new THREE.Mesh(barrelGeo, metalMat);
+    barrel.name = 'Cold-Hammer Forged Barrel';
+    barrel.position.set(receiverW / 2 + barrelLength / 2, 0.52, 0);
+    group.add(barrel);
+
+    // Muzzle Attachment (Suppressor or Muzzle Brake)
+    const isSuppressor = prng.bool(0.5);
+    if (isSuppressor) {
+      const supp = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.07, 0.4, 16), polyMat);
+      supp.rotateZ(Math.PI / 2);
+      supp.name = 'Tactical Suppressor Canister';
+      supp.position.set(receiverW / 2 + barrelLength + 0.2, 0.52, 0);
+      group.add(supp);
+    } else {
+      const muzzle = new THREE.Mesh(new THREE.BoxGeometry(0.15, 0.09, 0.09), metalMat);
+      muzzle.name = 'Compensator Muzzle Brake';
+      muzzle.position.set(receiverW / 2 + barrelLength + 0.08, 0.52, 0);
+      group.add(muzzle);
+    }
+
+    // Optic: Red Dot vs Telescopic Scope
+    const hasScope = isSniper || prng.bool(0.6);
+    if (hasScope) {
+      const scopeLen = isSniper ? 0.6 : 0.35;
+      const scopeGeo = new THREE.CylinderGeometry(0.065, 0.065, scopeLen, 16);
+      scopeGeo.rotateZ(Math.PI / 2);
+      const scope = new THREE.Mesh(scopeGeo, polyMat);
+      scope.name = isSniper ? 'Variable 12x Tactical Scope' : 'Holographic Reflex Sight';
+      scope.position.set(0, 0.72, 0);
+      group.add(scope);
+
+      const lens = new THREE.Mesh(new THREE.CircleGeometry(0.055, 16), glowMat);
+      lens.rotateY(-Math.PI / 2);
+      lens.position.set(scopeLen / 2 + 0.01, 0.72, 0);
+      group.add(lens);
+    }
+
+    // Magazine
+    const magGeo = new THREE.BoxGeometry(0.2, prng.range(0.35, 0.5), 0.12);
+    magGeo.rotateZ(0.2);
+    const mag = new THREE.Mesh(magGeo, polyMat);
+    mag.name = 'Detachable Polymer Magazine';
+    mag.position.set(0.1, 0.22, 0);
+    group.add(mag);
+
+    // Stock
+    const stock = new THREE.Mesh(new THREE.BoxGeometry(0.65, 0.28, 0.12), polyMat);
+    stock.name = 'Collapsible Buffer Stock';
+    stock.position.set(-receiverW / 2 - 0.25, 0.45, 0);
+    group.add(stock);
+
+    // Grip
+    const gripGeo = new THREE.BoxGeometry(0.12, 0.35, 0.1);
+    gripGeo.rotateZ(-0.3);
+    const grip = new THREE.Mesh(gripGeo, polyMat);
+    grip.name = 'Ergonomic Pistol Grip';
+    grip.position.set(-0.25, 0.25, 0);
+    group.add(grip);
+
+    // Sci-Fi Power Line or Energy Cell
+    if (isPlasma) {
+      const cell = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.06, 0.18), glowMat);
+      cell.name = 'Plasma Energy Cell';
+      cell.position.set(0.2, 0.52, 0);
+      group.add(cell);
+    }
+  }
+}
+
+/**
+ * Procedural Ancient Relic / Crystal / Altar / Totem Prop
+ */
+function buildRelicArtifactProp(group: THREE.Group, prompt: string, prng: ReturnType<typeof createPRNG>) {
+  const crystalPal = [0x00f0ff, 0xa855f7, 0x10b981, 0xf59e0b, 0xef4444, 0x3b82f6];
+  const stoneMat = new THREE.MeshStandardMaterial({ color: 0x334155, roughness: 0.9 });
+  const goldMat = new THREE.MeshStandardMaterial({ color: 0xf59e0b, metalness: 0.9, roughness: 0.2 });
+  const glowMat = new THREE.MeshStandardMaterial({
+    color: prng.color(crystalPal),
+    emissive: prng.color(crystalPal),
+    emissiveIntensity: 1.8
+  });
+
+  // Stone Pillar Pedestal
+  const pedestal = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.55, 0.9, 8), stoneMat);
+  pedestal.name = 'Carved Runic Pedestal';
+  pedestal.position.y = 0.45;
+  group.add(pedestal);
+
+  const ring = new THREE.Mesh(new THREE.TorusGeometry(0.42, 0.05, 12, 24), goldMat);
+  ring.rotateX(Math.PI / 2);
+  ring.position.y = 0.9;
+  group.add(ring);
+
+  // Floating Levitation Crystal
+  const crystal = new THREE.Mesh(new THREE.OctahedronGeometry(0.35, 0), glowMat);
+  crystal.name = 'Ethereal Resonant Core';
+  crystal.position.y = 1.45;
+  group.add(crystal);
+
+  // Orbiting Shards
+  const shardCount = prng.int(3, 5);
+  for (let i = 0; i < shardCount; i++) {
+    const angle = (i * Math.PI * 2) / shardCount;
+    const shard = new THREE.Mesh(new THREE.ConeGeometry(0.06, 0.2, 6), glowMat);
+    shard.name = `Orbiting Arcane Fragment ${i + 1}`;
+    shard.position.set(Math.cos(angle) * 0.45, 1.45 + Math.sin(angle) * 0.1, Math.sin(angle) * 0.45);
+    shard.rotateZ(0.4);
+    group.add(shard);
+  }
+}
+
+/**
+ * Procedural Sci-Fi Terminal / Console / Server Rack
+ */
+function buildSciFiTerminalProp(group: THREE.Group, prng: ReturnType<typeof createPRNG>) {
+  const metalMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, metalness: 0.85, roughness: 0.3 });
+  const darkMat = new THREE.MeshStandardMaterial({ color: 0x0f172a, roughness: 0.8 });
+  const screenGlow = new THREE.MeshStandardMaterial({ color: 0x00f0ff, emissive: 0x00e5ff, emissiveIntensity: 1.5 });
+  const keyboardMat = new THREE.MeshStandardMaterial({ color: 0x334155, roughness: 0.5 });
+
+  // Console Base
+  const baseDesk = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.85, 0.7), metalMat);
+  baseDesk.name = 'Terminal Workstation Base';
+  baseDesk.position.y = 0.425;
+  group.add(baseDesk);
+
+  // Keyboard Deck
+  const keyboard = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.04, 0.3), keyboardMat);
+  keyboard.name = 'Tactile Input Terminal';
+  keyboard.position.set(0, 0.87, 0.15);
+  group.add(keyboard);
+
+  // Angled Holographic Monitor Screen
+  const screen = new THREE.Mesh(new THREE.BoxGeometry(0.95, 0.65, 0.05), screenGlow);
+  screen.name = 'Holographic Tactical Display';
+  screen.position.set(0, 1.25, -0.15);
+  screen.rotateX(-0.25);
+  group.add(screen);
+
+  // Status Lights
+  [-0.3, -0.1, 0.1, 0.3].forEach((x, i) => {
+    const light = new THREE.Mesh(
+      new THREE.SphereGeometry(0.03, 8, 8),
+      new THREE.MeshStandardMaterial({ color: i % 2 === 0 ? 0x10b981 : 0xf59e0b, emissive: i % 2 === 0 ? 0x10b981 : 0xf59e0b })
+    );
+    light.position.set(x, 0.86, -0.28);
+    group.add(light);
+  });
+}
+
+/**
+ * Universal Prop Model router that parses prompts and applies PRNG variations.
+ */
+export function buildProp3DModel(prompt: string, seed?: string | number): THREE.Group {
+  const group = new THREE.Group();
+  group.name = 'Prop_3D_Model';
+
+  const prng = createPRNG(seed || `${prompt}_${Date.now()}_${Math.random()}`);
+  const p = prompt.toLowerCase();
+
+  if (p.includes('potion') || p.includes('flask') || p.includes('bottle') || p.includes('elixir') || p.includes('vial')) {
+    buildPotionFlaskProp(group, prompt, prng);
+  } else if (p.includes('sword') || p.includes('axe') || p.includes('hammer') || p.includes('blade') || p.includes('mace') || p.includes('spear') || p.includes('katana') || p.includes('melee') || p.includes('scythe') || p.includes('halberd') || p.includes('dagger')) {
+    buildMeleeWeaponProp(group, prompt, prng);
+  } else if (p.includes('speeder') || p.includes('vehicle') || p.includes('ship') || p.includes('bike') || p.includes('hovercraft') || p.includes('car')) {
+    buildSpeederVehicleProp(group, prng);
+  } else if (p.includes('chest') || p.includes('crate') || p.includes('vault') || p.includes('box') || p.includes('container') || p.includes('loot')) {
+    buildTreasureChestProp(group, prompt, prng);
+  } else if (p.includes('crystal') || p.includes('relic') || p.includes('artifact') || p.includes('totem') || p.includes('gem') || p.includes('orb') || p.includes('altar') || p.includes('statue')) {
+    buildRelicArtifactProp(group, prompt, prng);
+  } else if (p.includes('terminal') || p.includes('computer') || p.includes('console') || p.includes('server') || p.includes('device') || p.includes('drone')) {
+    buildSciFiTerminalProp(group, prng);
+  } else {
+    // Guns, Rifles, Weapons, or default interactive equipment with dynamic PRNG
+    buildDynamicFirearmProp(group, prompt, prng);
+  }
+
+  // Display pedestal
+  const base = new THREE.Mesh(
+    new THREE.CylinderGeometry(1.3, 1.4, 0.06, 32),
+    new THREE.MeshStandardMaterial({ color: 0x0f172a, roughness: 0.9 })
+  );
+  base.name = 'Prop Display Stand';
+  base.position.y = -0.03;
+  group.add(base);
+
+  return group;
+}
+
+// ---------------------------------------------------------------------------
+// Rich Procedural Environment Generators
+// ---------------------------------------------------------------------------
+
+/**
+ * Procedural Floating Sky Island Diorama
+ */
+function buildFloatingIslandEnvironment(group: THREE.Group, prng: ReturnType<typeof createPRNG>) {
+  const rockColors = [0x334155, 0x1e293b, 0x475569, 0x292524];
+  const foliageColors = [0x10b981, 0x059669, 0x15803d, 0x047857, 0xa855f7];
+  const crystalColors = [0x38bdf8, 0x06b6d4, 0x818cf8, 0xf43f5e, 0xfacc15];
+
+  const rockMat = new THREE.MeshStandardMaterial({ color: prng.color(rockColors), roughness: 0.9 });
+  const grassMat = new THREE.MeshStandardMaterial({ color: prng.color(foliageColors), roughness: 0.75 });
+  const crystalMat = new THREE.MeshStandardMaterial({
+    color: prng.color(crystalColors),
+    emissive: prng.color(crystalColors),
+    emissiveIntensity: 1.5
+  });
+
+  // Main Floating Island Rock (Tapering downward cone)
+  const islandRock = new THREE.Mesh(new THREE.ConeGeometry(2.1, 2.0, 24), rockMat);
+  islandRock.name = 'Island Underside Crag';
+  islandRock.rotateX(Math.PI);
+  islandRock.position.y = 0.5;
+  group.add(islandRock);
+
+  // Lush Grass Surface Cap
+  const grassCap = new THREE.Mesh(new THREE.CylinderGeometry(2.12, 2.12, 0.28, 24), grassMat);
+  grassCap.name = 'Terrain Top Plateau';
+  grassCap.position.y = 1.35;
+  group.add(grassCap);
+
+  // Floating Crystals (3 to 6)
+  const crystalCount = prng.int(3, 6);
+  for (let i = 0; i < crystalCount; i++) {
+    const angle = (i * Math.PI * 2) / crystalCount;
+    const r = prng.range(0.6, 1.4);
+    const crys = new THREE.Mesh(new THREE.OctahedronGeometry(prng.range(0.18, 0.3), 0), crystalMat);
+    crys.name = `Resonant Sky Crystal ${i + 1}`;
+    crys.position.set(Math.cos(angle) * r, prng.range(1.6, 2.4), Math.sin(angle) * r);
+    crys.rotation.set(prng.range(0, Math.PI), prng.range(0, Math.PI), 0);
+    group.add(crys);
+  }
+
+  // Ancient Ruined Arch / Monoliths
+  const archCol1 = new THREE.Mesh(new THREE.BoxGeometry(0.28, 1.2, 0.28), rockMat);
+  archCol1.name = 'Ruined Colonnade Left';
+  archCol1.position.set(-0.65, 1.95, 0.2);
+  group.add(archCol1);
+
+  const archCol2 = new THREE.Mesh(new THREE.BoxGeometry(0.28, 1.2, 0.28), rockMat);
+  archCol2.name = 'Ruined Colonnade Right';
+  archCol2.position.set(0.65, 1.95, 0.2);
+  group.add(archCol2);
+
+  const archBeam = new THREE.Mesh(new THREE.BoxGeometry(1.65, 0.24, 0.32), rockMat);
+  archBeam.name = 'Arch Lintel Beam';
+  archBeam.position.set(0, 2.6, 0.2);
+  group.add(archBeam);
+}
+
+/**
+ * Procedural Cyberpunk Neon City Block Diorama
+ */
+function buildCyberpunkCityEnvironment(group: THREE.Group, prng: ReturnType<typeof createPRNG>) {
+  const roadMat = new THREE.MeshStandardMaterial({ color: 0x0f172a, roughness: 0.8 });
+  const buildingMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, metalness: 0.8, roughness: 0.3 });
+  const neonPalette = [0x00f0ff, 0xf43f5e, 0xa855f7, 0x10b981, 0xfacc15];
+  const c1 = prng.color(neonPalette);
+  const c2 = prng.color(neonPalette);
+
+  const neon1 = new THREE.MeshStandardMaterial({ color: c1, emissive: c1, emissiveIntensity: 1.6 });
+  const neon2 = new THREE.MeshStandardMaterial({ color: c2, emissive: c2, emissiveIntensity: 1.6 });
+
+  // Ground Road Base
+  const road = new THREE.Mesh(new THREE.BoxGeometry(3.6, 0.15, 3.6), roadMat);
+  road.name = 'Asphalt Highway Base';
+  road.position.y = 0.08;
+  group.add(road);
+
+  // Tower 1
+  const t1H = prng.range(2.6, 3.5);
+  const tower1 = new THREE.Mesh(new THREE.BoxGeometry(1.0, t1H, 1.0), buildingMat);
+  tower1.name = 'Megastructure Tower Alpha';
+  tower1.position.set(-0.8, t1H / 2, -0.6);
+  group.add(tower1);
+
+  // Billboard on Tower 1
+  const board1 = new THREE.Mesh(new THREE.PlaneGeometry(0.8, 0.5), neon1);
+  board1.name = 'Holographic Commercial Billboard';
+  board1.position.set(-0.8, t1H - 0.4, -0.08);
+  group.add(board1);
+
+  // Tower 2
+  const t2H = prng.range(1.8, 2.5);
+  const tower2 = new THREE.Mesh(new THREE.BoxGeometry(1.1, t2H, 1.1), buildingMat);
+  tower2.name = 'Megastructure Tower Beta';
+  tower2.position.set(0.8, t2H / 2, 0.6);
+  group.add(tower2);
+
+  const ribbon = new THREE.Mesh(new THREE.BoxGeometry(1.12, 0.1, 1.12), neon2);
+  ribbon.name = 'Neon Facade Ribbon';
+  ribbon.position.set(0.8, t2H * 0.75, 0.6);
+  group.add(ribbon);
+
+  // Elevated Skybridge
+  const bridge = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.18, 1.6), buildingMat);
+  bridge.name = 'Elevated Skybridge';
+  bridge.position.set(0, 1.8, 0);
+  bridge.rotateY(Math.PI / 4);
+  group.add(bridge);
+}
+
+/**
+ * Procedural Dungeon Crypt / Catacombs Environment
+ */
+function buildDungeonCryptEnvironment(group: THREE.Group, prng: ReturnType<typeof createPRNG>) {
+  const stoneMat = new THREE.MeshStandardMaterial({ color: 0x334155, roughness: 0.95 });
+  const darkStone = new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.9 });
+  const torchGlow = new THREE.MeshStandardMaterial({ color: 0xf97316, emissive: 0xea580c, emissiveIntensity: 1.8 });
+
+  // Stone flagstone floor
+  const floor = new THREE.Mesh(new THREE.BoxGeometry(3.6, 0.2, 3.6), darkStone);
+  floor.name = 'Crypt Stone Floor';
+  floor.position.y = 0.1;
+  group.add(floor);
+
+  // 4 Dungeon Pillars
+  [-1.0, 1.0].forEach(x => {
+    [-1.0, 1.0].forEach(z => {
+      const col = new THREE.Mesh(new THREE.BoxGeometry(0.4, 2.2, 0.4), stoneMat);
+      col.name = 'Gothic Crypt Column';
+      col.position.set(x, 1.2, z);
+      group.add(col);
+
+      // Wall Torch on Pillar
+      const torch = new THREE.Mesh(new THREE.SphereGeometry(0.08, 8, 8), torchGlow);
+      torch.name = 'Braziers of Fire';
+      torch.position.set(x * 0.85, 1.6, z * 0.85);
+      group.add(torch);
+    });
+  });
+
+  // Central Stone Sarcophagus / Altar
+  const sarcophagus = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.65, 0.9), stoneMat);
+  sarcophagus.name = 'Ancient Stone Sarcophagus';
+  sarcophagus.position.set(0, 0.45, 0);
+  group.add(sarcophagus);
+
+  const lid = new THREE.Mesh(new THREE.BoxGeometry(1.7, 0.15, 1.0), darkStone);
+  lid.name = 'Sarcophagus Carved Lid';
+  lid.position.set(0, 0.82, 0);
+  group.add(lid);
+}
+
+/**
+ * Procedural Desert Canyon / Wasteland Environment
+ */
+function buildDesertCanyonEnvironment(group: THREE.Group, prng: ReturnType<typeof createPRNG>) {
+  const sandMat = new THREE.MeshStandardMaterial({ color: 0xd97706, roughness: 0.85 });
+  const rockMat = new THREE.MeshStandardMaterial({ color: 0xb45309, roughness: 0.9 });
+  const sunGlow = new THREE.MeshStandardMaterial({ color: 0xfef08a, emissive: 0xfacc15, emissiveIntensity: 1.2 });
+
+  // Dunes Base
+  const dunes = new THREE.Mesh(new THREE.CylinderGeometry(2.0, 2.2, 0.3, 24), sandMat);
+  dunes.name = 'Desert Dunes Basin';
+  dunes.position.y = 0.15;
+  group.add(dunes);
+
+  // Mesa Cliffs
+  [-0.9, 0.8].forEach((x, idx) => {
+    const mesaH = prng.range(1.6, 2.4);
+    const mesa = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.75, mesaH, 8), rockMat);
+    mesa.name = `Sandstone Canyon Mesa ${idx + 1}`;
+    mesa.position.set(x, mesaH / 2 + 0.2, (idx === 0 ? -0.6 : 0.6));
+    group.add(mesa);
+  });
+
+  // Desert Arch
+  const arch = new THREE.Mesh(new THREE.TorusGeometry(0.8, 0.2, 8, 16, Math.PI), rockMat);
+  arch.name = 'Natural Rock Arch';
+  arch.position.set(0, 0.9, 0);
+  group.add(arch);
+}
+
+/**
+ * Universal Environment router based on prompt and PRNG seed
+ */
+export function buildEnvironment3DModel(prompt: string, seed?: string | number): THREE.Group {
+  const group = new THREE.Group();
+  group.name = 'Environment_3D_Diorama';
+
+  const prng = createPRNG(seed || `${prompt}_${Date.now()}_${Math.random()}`);
+  const p = prompt.toLowerCase();
+
+  if (p.includes('cyberpunk') || p.includes('city') || p.includes('neon') || p.includes('urban') || p.includes('sci-fi') || p.includes('station')) {
+    buildCyberpunkCityEnvironment(group, prng);
+  } else if (p.includes('dungeon') || p.includes('crypt') || p.includes('catacomb') || p.includes('cave') || p.includes('interior') || p.includes('temple')) {
+    buildDungeonCryptEnvironment(group, prng);
+  } else if (p.includes('desert') || p.includes('canyon') || p.includes('wasteland') || p.includes('sand') || p.includes('dune')) {
+    buildDesertCanyonEnvironment(group, prng);
+  } else {
+    // Default to Floating Sky Island / Fantasy Realm
+    buildFloatingIslandEnvironment(group, prng);
+  }
+
+  return group;
+}
+
+// ---------------------------------------------------------------------------
+// Rich Procedural UI / Diegetic HUD Generators
+// ---------------------------------------------------------------------------
+
+/**
+ * Procedural Sci-Fi Visor HUD
+ */
+function buildVisorHUD(group: THREE.Group, prng: ReturnType<typeof createPRNG>) {
+  const pal = [0x00f0ff, 0x10b981, 0xa855f7, 0xf59e0b];
+  const primaryCol = prng.color(pal);
+
+  const holoCyan = new THREE.MeshStandardMaterial({
+    color: primaryCol,
+    emissive: primaryCol,
+    emissiveIntensity: 1.5,
+    transparent: true,
+    opacity: 0.85
+  });
+
+  const holoOrange = new THREE.MeshStandardMaterial({
+    color: 0xffaa00,
+    emissive: 0xff8800,
+    emissiveIntensity: 1.2,
+    transparent: true,
+    opacity: 0.8
+  });
+
+  // Curved Visor Arc
+  const arc = new THREE.Mesh(
+    new THREE.TorusGeometry(1.6, 0.03, 16, 64, Math.PI * 1.2),
+    holoCyan
+  );
+  arc.name = 'Curved Helmet HUD Arc';
+  arc.position.y = 1.2;
+  group.add(arc);
+
+  // Center Reticle
+  const reticleRing = new THREE.Mesh(new THREE.RingGeometry(0.28, 0.32, 32), holoCyan);
+  reticleRing.name = 'Targeting Reticle Optic';
+  reticleRing.position.set(0, 1.2, 0);
+  group.add(reticleRing);
+
+  // Horizontal Crosshairs
+  [-0.45, 0.45].forEach((x, idx) => {
+    const tick = new THREE.Mesh(new THREE.PlaneGeometry(0.18, 0.03), holoCyan);
+    tick.name = `Optic Hashmark ${idx + 1}`;
+    tick.position.set(x, 1.2, 0);
+    group.add(tick);
+  });
+
+  // Health / Energy Bar
+  const barBack = new THREE.Mesh(new THREE.PlaneGeometry(1.2, 0.12), new THREE.MeshBasicMaterial({ color: 0x1f2937 }));
+  barBack.name = 'Shield Vitals Gauge Backing';
+  barBack.position.set(-0.6, 0.5, 0.1);
+  group.add(barBack);
+
+  const barFill = new THREE.Mesh(new THREE.PlaneGeometry(0.9, 0.08), holoOrange);
+  barFill.name = 'Vitals Capacity Bar';
+  barFill.position.set(-0.75, 0.5, 0.12);
+  group.add(barFill);
+
+  // 3D Radar Disc on floor
+  const radarDisc = new THREE.Mesh(new THREE.RingGeometry(0.1, 1.0, 32), holoCyan);
+  radarDisc.name = 'Tactical Nav Compass Ring';
+  radarDisc.rotateX(-Math.PI / 2);
+  radarDisc.position.y = 0.05;
+  group.add(radarDisc);
+}
+
+/**
+ * Procedural Fantasy RPG Diegetic HUD
+ */
+function buildFantasyRPGHUD(group: THREE.Group, prng: ReturnType<typeof createPRNG>) {
+  const goldMat = new THREE.MeshStandardMaterial({ color: 0xf59e0b, metalness: 0.9, roughness: 0.2 });
+  const redGlobe = new THREE.MeshStandardMaterial({ color: 0xef4444, emissive: 0xdc2626, emissiveIntensity: 1.4 });
+  const blueGlobe = new THREE.MeshStandardMaterial({ color: 0x3b82f6, emissive: 0x2563eb, emissiveIntensity: 1.4 });
+
+  // Left Health Globe
+  const healthOrb = new THREE.Mesh(new THREE.SphereGeometry(0.4, 24, 24), redGlobe);
+  healthOrb.name = 'Health Vitality Vessel';
+  healthOrb.position.set(-1.2, 0.6, 0);
+  group.add(healthOrb);
+
+  const healthPedestal = new THREE.Mesh(new THREE.CylinderGeometry(0.45, 0.5, 0.2, 16), goldMat);
+  healthPedestal.name = 'Gilded Health Pedestal';
+  healthPedestal.position.set(-1.2, 0.1, 0);
+  group.add(healthPedestal);
+
+  // Right Mana Globe
+  const manaOrb = new THREE.Mesh(new THREE.SphereGeometry(0.4, 24, 24), blueGlobe);
+  manaOrb.name = 'Mana Essence Vessel';
+  manaOrb.position.set(1.2, 0.6, 0);
+  group.add(manaOrb);
+
+  const manaPedestal = new THREE.Mesh(new THREE.CylinderGeometry(0.45, 0.5, 0.2, 16), goldMat);
+  manaPedestal.name = 'Gilded Mana Pedestal';
+  manaPedestal.position.set(1.2, 0.1, 0);
+  group.add(manaPedestal);
+
+  // Center Action Bar Slots
+  const slotCount = prng.int(4, 6);
+  const spacing = 1.6 / slotCount;
+  for (let i = 0; i < slotCount; i++) {
+    const x = -0.8 + (i + 0.5) * spacing;
+    const slot = new THREE.Mesh(new THREE.BoxGeometry(spacing * 0.8, spacing * 0.8, 0.05), goldMat);
+    slot.name = `Hotbar Ability Slot ${i + 1}`;
+    slot.position.set(x, 0.2, 0);
+    group.add(slot);
+  }
+}
+
+/**
+ * Universal 3D UI router based on prompt
+ */
+export function buildUI3DModel(prompt: string, seed?: string | number): THREE.Group {
+  const group = new THREE.Group();
+  group.name = 'UI_3D_Model';
+
+  const prng = createPRNG(seed || `${prompt}_${Date.now()}_${Math.random()}`);
+  const p = prompt.toLowerCase();
+
+  if (p.includes('fantasy') || p.includes('rpg') || p.includes('orb') || p.includes('mana') || p.includes('medieval')) {
+    buildFantasyRPGHUD(group, prng);
+  } else {
+    buildVisorHUD(group, prng);
+  }
+
+  return group;
+}
+
+// ---------------------------------------------------------------------------
+// Rich Level Blockout Generator
+// ---------------------------------------------------------------------------
+
+export function buildLevel3DBlockout(layout: LevelLayout): THREE.Group {
+  const group = new THREE.Group();
+  group.name = `Level_${layout.name.replace(/\s+/g, '_')}`;
+
+  const floorMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.8, metalness: 0.2 });
+  const wallMat = new THREE.MeshStandardMaterial({ color: 0x334155, roughness: 0.7, metalness: 0.3 });
+  const accentMat = new THREE.MeshStandardMaterial({ color: 0x0284c7, roughness: 0.5, metalness: 0.6 });
+
+  // Main Floor Arena
+  const floor = new THREE.Mesh(new THREE.BoxGeometry(22, 0.4, 22), floorMat);
+  floor.position.y = -0.2;
+  floor.receiveShadow = true;
+  group.add(floor);
+
+  // Outer Perimeter Walls
+  const wallThickness = 0.5;
+  const wallHeight = 2.2;
+  const wallLength = 22;
+
+  // North wall
+  const northWall = new THREE.Mesh(new THREE.BoxGeometry(wallLength, wallHeight, wallThickness), wallMat);
+  northWall.position.set(0, wallHeight / 2, -11);
+  group.add(northWall);
+
+  // South wall
+  const southWall = new THREE.Mesh(new THREE.BoxGeometry(wallLength, wallHeight, wallThickness), wallMat);
+  southWall.position.set(0, wallHeight / 2, 11);
+  group.add(southWall);
+
+  // East wall
+  const eastWall = new THREE.Mesh(new THREE.BoxGeometry(wallThickness, wallHeight, wallLength), wallMat);
+  eastWall.position.set(11, wallHeight / 2, 0);
+  group.add(eastWall);
+
+  // West wall
+  const westWall = new THREE.Mesh(new THREE.BoxGeometry(wallThickness, wallHeight, wallLength), wallMat);
+  westWall.position.set(-11, wallHeight / 2, 0);
+  group.add(westWall);
+
+  // Raised Catwalks
+  const catwalk = new THREE.Mesh(new THREE.BoxGeometry(8, 0.2, 2.5), accentMat);
+  catwalk.position.set(0, 1.8, -7);
+  group.add(catwalk);
+
+  // Access Stairs to Catwalk
+  const ramp = new THREE.Mesh(new THREE.BoxGeometry(2, 0.15, 4.5), floorMat);
+  ramp.position.set(-5, 0.9, -7);
+  ramp.rotateX(-0.35);
+  group.add(ramp);
+
+  // Points of Interest Placement
+  layout.pointsOfInterest.forEach((poi) => {
+    const poiGroup = new THREE.Group();
+    poiGroup.name = `POI_${poi.name.replace(/\s+/g, '_')}`;
+
+    const posX = ((poi.x - 50) / 50) * 8.5;
+    const posZ = ((poi.y - 50) / 50) * 8.5;
+    poiGroup.position.set(posX, 0, posZ);
+
+    if (poi.type === 'Spawn') {
+      // Spawn Teleporter Pad
+      const pad = new THREE.Mesh(new THREE.CylinderGeometry(1.2, 1.3, 0.2, 24), floorMat);
+      pad.position.y = 0.1;
+      poiGroup.add(pad);
+
+      const ring = new THREE.Mesh(
+        new THREE.RingGeometry(0.6, 0.8, 24),
+        new THREE.MeshStandardMaterial({ color: 0x10b981, emissive: 0x059669, emissiveIntensity: 1.2 })
+      );
+      ring.rotateX(-Math.PI / 2);
+      ring.position.y = 0.21;
+      poiGroup.add(ring);
+    } else if (poi.type === 'Boss') {
+      // Boss Arena with 4 Pillars
+      const arena = new THREE.Mesh(new THREE.CylinderGeometry(2.4, 2.5, 0.3, 32), floorMat);
+      arena.position.y = 0.15;
+      poiGroup.add(arena);
+
+      for (let i = 0; i < 4; i++) {
+        const angle = (i * Math.PI) / 2;
+        const pil = new THREE.Mesh(new THREE.BoxGeometry(0.35, 2.4, 0.35), wallMat);
+        pil.position.set(Math.cos(angle) * 1.8, 1.2, Math.sin(angle) * 1.8);
+        poiGroup.add(pil);
+      }
+    } else if (poi.type === 'Loot') {
+      // Loot Crate
+      const crate = new THREE.Mesh(
+        new THREE.BoxGeometry(0.7, 0.55, 0.7),
+        new THREE.MeshStandardMaterial({ color: 0xf59e0b, emissive: 0xd97706, emissiveIntensity: 0.8 })
+      );
+      crate.position.y = 0.28;
+      poiGroup.add(crate);
+    } else {
+      // Tactical Cover Obstacle
+      const cover = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.8, 0.3), wallMat);
+      cover.position.set(0, 0.4, 0);
+      poiGroup.add(cover);
+    }
+
+    group.add(poiGroup);
+  });
+
+  return group;
+}
+
+// ---------------------------------------------------------------------------
+// Universal 3D Asset Generator Router
+// ---------------------------------------------------------------------------
+
+export function generate3DAsset(category: Asset3DCategory, prompt: string, layout?: LevelLayout, seed?: string | number): THREE.Group {
+  switch (category) {
+    case 'Character':
+      return buildCharacter3DModel(prompt, seed);
+    case 'Prop':
+      return buildProp3DModel(prompt, seed);
+    case 'Environment':
+      return buildEnvironment3DModel(prompt, seed);
+    case 'UI':
+      return buildUI3DModel(prompt, seed);
+    case 'Level':
+      if (layout) return buildLevel3DBlockout(layout);
+      return buildEnvironment3DModel(prompt, seed);
+    default:
+      return buildProp3DModel(prompt, seed);
+  }
+}

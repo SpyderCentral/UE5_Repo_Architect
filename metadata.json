@@ -1,0 +1,12 @@
+{
+  "name": "Remix UE5 Game Dev Architect",
+  "description": "AI-powered Unreal Engine 5 game development planner tailored to user requirements, genres, and experience levels.",
+  "requestFramePermissions": [
+    "microphone",
+    "geolocation",
+    "display-capture"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
